@@ -1,0 +1,23 @@
+{
+  "name": "agent-guardian",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "通用跨 CLI 运行期监督与讨论组编排（Node 零运行时依赖，type-stripping 直跑 .ts）",
+  "keywords": [
+    "pi-package",
+    "supervision",
+    "orca"
+  ],
+  "bin": {
+    "guardian": "./scripts/guardian.ts"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}
