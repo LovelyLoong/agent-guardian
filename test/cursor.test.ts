@@ -97,6 +97,10 @@ class SpyTarget implements TargetAdapter {
   /** 每次取证收到的检查点游标（上次已消费位置） */
   readonly cursors: Array<string | null> = [];
   private readonly signals: Signal[];
+  /** V2a L4 传感替身：最近命令文本 */
+  recentCommands: string[] = [];
+  /** newToolCalls 脚本（缺省：首拍 1，其后 0；V2a 暂停复工语义测试用） */
+  newToolCallsScript: ((call: number) => number) | null = null;
 
   constructor(signals: Signal[] = [], kind: "pi" | "codex" | "terminal" = "pi") {
     this.signals = signals;
@@ -110,8 +114,9 @@ class SpyTarget implements TargetAdapter {
     return {
       facts: {
         toolCallsSeen: this.calls,
-        newToolCalls: this.calls === 1 ? 1 : 0,
+        newToolCalls: this.newToolCallsScript !== null ? this.newToolCallsScript(this.calls) : (this.calls === 1 ? 1 : 0),
         signals: this.signals,
+        recentCommands: [...this.recentCommands],
         tailSummary: "tail",
         taskSummary: "任务",
       },
@@ -241,6 +246,7 @@ function harness(opts: HarnessOptions = {}) {
     budgetMs: opts.budgetMs ?? 1_000_000,
     remindMax: 5,
     sessionFile: "f.jsonl",
+    workspaceRoot: "/workspace", // V2a：L4 硬边界判定的工作区根目录（测试固定）
     runPanel: opts.runPanel ?? null,
   };
   return { services, watchOpts, channel, target, sleeps, dir, clock: () => clock, waitCalls };
@@ -308,7 +314,7 @@ describe("游标纪律", () => {
     assert.strictEqual(h.target.calls, 1); // 只取证一次
     assert.ok(h.sleeps.includes(60_000)); // 无进展拍 sleep 60s
     const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "budget-expired-idle"));
+    assert.ok(evs.some((e) => e.type === "budget-expired"));
   });
 
   it("游标前进才取证，取证带上次检查点游标", async () => {
@@ -371,7 +377,7 @@ describe("生命周期退出路径", () => {
     const result = await runWatch(h.watchOpts, h.services);
     assert.strictEqual(result.exitCode, 0);
     const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "budget-expired-idle"));
+    assert.ok(evs.some((e) => e.type === "budget-expired"));
     assert.ok(!h.channel.sends.some((s) => s.includes("警告")));
     assert.strictEqual(h.channel.stops, 0);
   });
@@ -381,319 +387,203 @@ describe("生命周期退出路径", () => {
 // 安全网 / 停止 / 纯观察 / panel 链路
 // ---------------------------------------------------------------------------
 
-describe("安全网与停止", () => {
-  it("LIVE-1 回归：预算到期→警告→目标仅回应警告（游标前进但 newToolCalls=0）→ stops=1 且不再发第二次警告", async () => {
-    // 实测事件流（19:58~20:03 反复警告不停止）：预算到期+目标活跃 → 警告 steer 以用户输入
-    // 提交进目标 → 目标处理警告文本（游标前进）→ 旧 M1 清闩（"改善"）→ 下拍再警告 → 死循环。
-    const h = harness({ budgetMs: 10_000, target: new NoNewToolCallsTarget() });
-    h.channel.kind = "orca";
-    h.channel.waitResults = ["timeout", "timeout"];
-    h.channel.reads = [
-      { text: "a", cursor: "10", alive: true }, // 拍1：超预算+活跃 → 最后警告（触发源 budget）
-      { text: "b", cursor: "20", alive: true }, // 拍2：游标前进（处理警告）但 newToolCalls=0 → 无真实改善 → 必须 stop
-    ];
-    const result = await runWatch(h.watchOpts, h.services);
-    assert.strictEqual(result.exitCode, 0);
-    assert.strictEqual(h.channel.sends.filter((s) => s.includes("警告")).length, 1, "不得再发第二次警告（ping-pong 死循环）");
-    assert.strictEqual(h.channel.stops, 1, "无真实改善 → 必须 executeStop");
-    const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "decide" && e.action === "safety-warning"));
-    assert.ok(!evs.some((e) => e.type === "safety-warning-cleared"), "幻影改善不得清闩");
-    assert.ok(evs.some((e) => e.type === "stop"));
-    assert.ok(evs.some((e) => e.type === "stop-issued"));
-    assert.ok(!evs.some((e) => e.type === "budget-expired-idle"), "活跃目标不得走静止直接收尾");
-    const loaded = await loadOk(h.services.state, "w-test");
-    assert.strictEqual(loaded?.safetyWarningSent, true, "未改善时闩锁不得清除");
-    assert.strictEqual(loaded?.safetyWarningTrigger, "budget", "触发源应持久化为 budget");
-  });
+// ---------------------------------------------------------------------------
+// V2a：干预语义重排（L1 提醒 → L2 警告需回应 → 暂停待命）与 L4 唯一停止路径
+// ---------------------------------------------------------------------------
 
-  it("崩溃恢复：safetyWarningSent=true 恢复续跑 → 同游标+存活 → 次拍必须 stop（B1；纯 terminal 目标无证据源）", async () => {
-    const h = harness({ budgetMs: 1_000_000, target: new SpyTarget([], "terminal") });
-    h.channel.kind = "orca";
-    h.channel.reads = [
-      { text: "", cursor: "10", alive: true },
-      { text: "", cursor: "10", alive: true },
-    ];
-    // 预置：崩溃前最后警告已发出（safetyWarningSent 已落盘）
-    const state = await seedState(h);
-    state.cursor = "10";
-    state.safetyWarningSent = true;
-    state.lastAction = "safety-warning";
-    await h.services.state.save("w-test", state);
-    const result = await runWatch(h.watchOpts, h.services);
-    assert.strictEqual(result.exitCode, 0);
-    // postWarning 必须从持久化状态恢复：恢复首拍即走无进展分支 → stop，
-    // 不得先取证再 sleep 续跑或 budget-expired-idle 绕过。
-    assert.strictEqual(h.channel.stops, 1, "恢复后同游标+目标存活 → 必须 stop");
-    assert.strictEqual(h.target.calls, 0, "恢复首拍即 stop，不得先取证（B1 恢复初始化）");
-    const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "watch_resume"));
-    assert.ok(evs.some((e) => e.type === "stop"));
-    assert.ok(evs.some((e) => e.type === "stop-issued"));
-    assert.ok(!evs.some((e) => e.type === "budget-expired-idle"), "恢复后不得走 budget-expired-idle 绕过 stop");
-    assert.ok(evs.some((e) => e.type === "finish" && String(e.reason).includes("安全网收尾")));
-  });
-
-  it("B1 恢复初始化：state.cursor 初始化 lastGoodCursor——恢复首拍同游标+存活 → 首拍即 stop（不被取证分支拦截；纯 terminal 目标）", async () => {
-    const h = harness({ budgetMs: 1_000_000, target: new SpyTarget(spinSignals(), "terminal") });
-    h.channel.kind = "orca";
-    h.channel.reads = [{ text: "", cursor: "5", alive: true }];
-    // 预置：崩溃前已发最后警告且成功取证到游标 '5'
-    const state = await seedState(h);
-    state.cursor = "5";
-    state.safetyWarningSent = true;
-    state.lastAction = "safety-warning";
-    await h.services.state.save("w-test", state);
-    const result = await runWatch(h.watchOpts, h.services);
-    assert.strictEqual(result.exitCode, 0);
-    assert.strictEqual(h.channel.stops, 1, "恢复首拍同游标+存活 → 必须 stop");
-    assert.strictEqual(h.target.calls, 0, "不得先进取证分支再停（B1 结构性修复）");
-    const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "stop"));
-    assert.ok(evs.some((e) => e.type === "stop-issued"));
-    assert.ok(evs.some((e) => e.type === "finish" && String(e.reason).includes("安全网收尾")));
-  });
-
-  it("B1 恢复+取证异常组合：取证失败按上限退出前仍须先执行 stop（stop 是既有承诺）", async () => {
-    const h = harness({ budgetMs: 1_000_000, target: new BrokenTarget() });
-    h.channel.kind = "orca";
-    // 恢复游标 '5'；首拍游标前进到 '6'（改善已观察），此后取证持续失败
-    h.channel.reads = [{ text: "b", cursor: "6", alive: true }];
-    const state = await seedState(h);
-    state.cursor = "5";
-    state.safetyWarningSent = true;
-    state.lastAction = "safety-warning";
-    await h.services.state.save("w-test", state);
-    const result = await runWatch(h.watchOpts, h.services);
-    assert.strictEqual(result.exitCode, 0);
-    assert.strictEqual(h.channel.stops, 1, "目标仍 alive 且 warning 已发，取证失败不得绕过 stop 承诺");
-    const evs = h.services.events.read("w-test");
-    assert.strictEqual(evs.filter((e) => e.type === "facts-error").length, MAX_CONSECUTIVE_FACTS_ERRORS);
-    assert.ok(evs.some((e) => e.type === "facts-error-exhausted"));
-    assert.ok(evs.some((e) => e.type === "stop"));
-    assert.ok(evs.some((e) => e.type === "stop-issued"));
-  });
-
-  it("B2 空游标恢复：持久化空游标 + 警告在身 + 游标不前进 → 取证前即 stop（探针 stops=1；纯 terminal 目标）", async () => {
-    const h = harness({ budgetMs: 1_000_000, target: new SpyTarget(spinSignals(), "terminal") });
-    h.channel.kind = "orca";
-    h.channel.reads = [{ text: "", cursor: "", alive: true }];
-    // 预置：崩溃前最后警告已发出，但成功取证的游标为空串（空游标恢复场景）
-    const state = await seedState(h);
-    state.cursor = "";
-    state.safetyWarningSent = true;
-    state.lastAction = "safety-warning";
-    await h.services.state.save("w-test", state);
-    const result = await runWatch(h.watchOpts, h.services);
-    assert.strictEqual(result.exitCode, 0);
-    // 旧缺陷：空游标恢复使 lastGoodCursor=null → 取证分支拦截 → 取证成功被
-    // M1 的"取证成功=改善"清闩 → 永不 stop。修复后必须取证前兑现 stop 承诺。
-    assert.strictEqual(h.channel.stops, 1, "空游标恢复+警告在身+游标不前进 → 必须 stop");
-    assert.strictEqual(h.target.calls, 0, "不得先取证（旧清闩路径不得绕过 stop）");
-    const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "stop"));
-    assert.ok(evs.some((e) => e.type === "stop-issued"));
-    assert.ok(evs.some((e) => e.type === "finish" && String(e.reason).includes("安全网收尾")));
-    const loaded = await loadOk(h.services.state, "w-test");
-    assert.strictEqual(loaded.safetyWarningSent, true, "未改善时闩锁不得清除");
-  });
-
-  it("LIVE-1 真实改善：warning→触发信号消失且自警告起 newToolCalls>0 → 清闩 → 后续静止拍不得 stop", async () => {
-    const h = harness({ budgetMs: 60_000, target: new GenuineImprovementTarget(spinSignals()) });
-    h.channel.kind = "orca";
-    h.channel.reads = [
-      { text: "a", cursor: "10", alive: true }, // 拍1：复现 → 最后警告
-      { text: "b", cursor: "20", alive: true }, // 拍2：信号消失 + 干活证据（newToolCalls>0）= 真实改善 → 清闩
-    ];
+describe("V2a 干预语义重排", () => {
+  /** 预置：同 incident（kind+factsHash）已提醒 2 次 → 本次复现到 L2 警告/LLM 回调点。 */
+  async function seedEscalated(h: ReturnType<typeof harness>, extra: Partial<WatchState> = {}): Promise<void> {
     const state = await seedState(h);
     state.remindCount = 1;
-    state.escalationCount = 1;
-    state.remindHistory = [{ kind: "spin", beat: 0, factsHash: signalKey(spinSignals()[0]!) }];
+    const key = signalKey(spinSignals()[0]!);
+    state.remindHistory = [
+      { kind: "spin", beat: 0, factsHash: key },
+      { kind: "spin", beat: 5, factsHash: key },
+    ];
+    Object.assign(state, extra);
     await h.services.state.save("w-test", state);
-    const result = await runWatch(h.watchOpts, h.services);
-    assert.strictEqual(result.exitCode, 0);
-    assert.strictEqual(h.channel.stops, 0, "真实改善后不得 stop");
-    assert.ok(h.channel.sends.some((s) => s.includes("警告")), "第一拍应发最后警告");
-    const loaded = await loadOk(h.services.state, "w-test");
-    assert.strictEqual(loaded?.safetyWarningSent, false, "真实改善后闩锁必须清除并持久化");
-    assert.strictEqual(loaded?.safetyWarningTrigger, null, "清闩后触发源必须重置");
-    const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "safety-warning-cleared"));
-    assert.ok(!evs.some((e) => e.type === "stop"));
-    assert.ok(evs.some((e) => e.type === "finish" && String(e.reason).includes("预算到期，目标静止")));
-  });
+  }
 
-  it("LIVE-1 幻影改善：warning→游标前进但 newToolCalls=0（仅回应警告）→ 不清闩 → 次拍必须 stop", async () => {
-    // 目标回应警告本身就会前进游标——游标前进永不清安全闩；
-    // 信号消失但无干活证据 → 仍不算改善 → 警告后无进展拍必须 stop。
-    const h = harness({ budgetMs: 60_000, target: new FirstBeatSignalTarget(spinSignals()) });
+  it("提醒复现 → L2 警告（steer 需回应）；信号复现 → 暂停待命 + 升级事件；无任何 stop", async () => {
+    const h = harness({ budgetMs: 1_000_000, target: new SpyTarget(spinSignals()) });
     h.channel.kind = "orca";
     h.channel.reads = [
-      { text: "a", cursor: "10", alive: true }, // 拍1：复现 → 最后警告
-      { text: "b", cursor: "20", alive: true }, // 拍2：信号消失但 newToolCalls=0 → 幻影改善，不清闩
+      { text: "a", cursor: "10", alive: true }, // 拍1：复现 → L2 警告
+      { text: "b", cursor: "20", alive: true }, // 拍2：信号复现（无 ACK）→ 暂停待命 + 升级事件
+      { text: "c", cursor: "30", alive: true }, // 拍3：暂停中 → 沉默
+      "dead",
+      "dead",
     ];
-    const state = await seedState(h);
-    state.remindCount = 1;
-    state.escalationCount = 1;
-    state.remindHistory = [{ kind: "spin", beat: 0, factsHash: signalKey(spinSignals()[0]!) }];
-    await h.services.state.save("w-test", state);
+    await seedEscalated(h);
     const result = await runWatch(h.watchOpts, h.services);
     assert.strictEqual(result.exitCode, 0);
-    assert.strictEqual(h.channel.stops, 1, "无干活证据 → 次拍必须 stop（游标前进不清安全闩）");
+    assert.strictEqual(h.channel.stops, 0, "V2a：无 L4 硬边界任何情况不 stop");
+    assert.ok(h.channel.sends.some((s) => s.includes("监督警告") && s.includes("需要你的回应确认")), "L2 警告文案需回应");
+    assert.ok(h.channel.sends.some((s) => s.includes("监督暂停")), "升级为暂停待命");
     const evs = h.services.events.read("w-test");
-    assert.ok(!evs.some((e) => e.type === "safety-warning-cleared"), "幻影改善不得清闩");
-    assert.ok(evs.some((e) => e.type === "stop"));
-    assert.ok(evs.some((e) => e.type === "stop-issued"));
+    assert.ok(evs.some((e) => e.type === "decide" && e.action === "warning" && e.ackRequired === true), "警告事件需 ACK");
+    assert.ok(evs.some((e) => e.type === "escalated" && e.to === "pause" && e.pinned === true), "升级事件置顶标记");
+    assert.ok(!evs.some((e) => e.type === "stop"), "不得产生 stop");
     const loaded = await loadOk(h.services.state, "w-test");
-    assert.strictEqual(loaded.safetyWarningSent, true, "未真实改善时闩锁不得清除");
+    assert.strictEqual(loaded?.paused, true, "暂停闩锁持久化");
+    assert.strictEqual(loaded?.warningSent, false, "升级为暂停后警告闩锁清除");
   });
 
-  it("残差 blocker：警告后游标前进+触发信号消失+newToolCalls=0 → 次拍即 stop，不静默续跑", async () => {
-    // 旧缺陷：警告后游标前进 → 触发信号消失但 newToolCalls=0 → 不清闩也不 stop，
-    // 落入 decide 返回 silence → 连续 cursor-only beats 永不停止（探针）。
-    // 修复：regular progress 分支在 decide 前统一兑现安全网承诺——无真实改善 →
-    // 次拍即 executeStop，且不再发第二次警告。
+  it("L2 警告确认：触发信号消失且 newToolCalls>0 → warning-acked 清闩，不暂停不停止", async () => {
+    const h = harness({ budgetMs: 1_000_000, target: new GenuineImprovementTarget(spinSignals()) });
+    h.channel.kind = "orca";
+    h.channel.reads = [
+      { text: "a", cursor: "10", alive: true }, // 拍1：复现 → L2 警告
+      { text: "b", cursor: "20", alive: true }, // 拍2：信号消失 + newToolCalls>0 → 确认
+      "dead",
+      "dead",
+    ];
+    await seedEscalated(h);
+    const result = await runWatch(h.watchOpts, h.services);
+    assert.strictEqual(result.exitCode, 0);
+    assert.strictEqual(h.channel.stops, 0);
+    assert.ok(h.channel.sends.some((s) => s.includes("监督警告")), "拍1发警告");
+    const evs = h.services.events.read("w-test");
+    assert.ok(evs.some((e) => e.type === "warning-acked"), "警告确认事件");
+    assert.ok(!evs.some((e) => e.type === "escalated"), "确认后不得升级");
+    const loaded = await loadOk(h.services.state, "w-test");
+    assert.strictEqual(loaded?.warningSent, false, "确认后闩锁清除并持久化");
+    assert.strictEqual(loaded?.warningTrigger, null);
+  });
+
+  it("警告后信号消失但无干活证据 → 沉默等待（warning-pending），不 stop、不重复干预", async () => {
     const h = harness({ budgetMs: 1_000_000, target: new FirstBeatSignalTarget(spinSignals()) });
     h.channel.kind = "orca";
     h.channel.reads = [
-      { text: "a", cursor: "10", alive: true }, // 拍1：复现 → 最后警告（触发源 spin）
-      { text: "b", cursor: "20", alive: true }, // 拍2：游标前进+信号消失但 newToolCalls=0 → 必须 stop
-      { text: "c", cursor: "30", alive: true },
-      { text: "d", cursor: "40", alive: true },
-      { text: "e", cursor: "50", alive: true },
-      { text: "f", cursor: "60", alive: true },
+      { text: "a", cursor: "10", alive: true }, // 拍1：复现 → L2 警告
+      { text: "b", cursor: "20", alive: true }, // 拍2：信号消失但 newToolCalls=0 → 等待
+      { text: "c", cursor: "30", alive: true }, // 拍3：持续等待（不得重复警告/暂停）
+      "dead",
+      "dead",
     ];
-    const state = await seedState(h);
-    state.remindCount = 1;
-    state.escalationCount = 1;
-    state.remindHistory = [{ kind: "spin", beat: 0, factsHash: signalKey(spinSignals()[0]!) }];
-    await h.services.state.save("w-test", state);
+    await seedEscalated(h);
     const result = await runWatch(h.watchOpts, h.services);
     assert.strictEqual(result.exitCode, 0);
-    assert.strictEqual(h.channel.stops, 1, "警告后无真实改善 → 必须 executeStop");
-    assert.strictEqual(h.target.calls, 2, "次拍即停，不得静默续跑（连续 cursor-only beats 探针）");
-    assert.strictEqual(h.channel.sends.filter((s) => s.includes("警告")).length, 1, "不得再发第二次警告");
-    const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "decide" && e.action === "safety-warning"));
-    assert.ok(!evs.some((e) => e.type === "safety-warning-cleared"), "无干活证据不得清闩");
-    assert.ok(evs.some((e) => e.type === "stop"));
-    assert.ok(evs.some((e) => e.type === "stop-issued"));
-    assert.ok(evs.some((e) => e.type === "finish" && String(e.reason).includes("安全网收尾")));
+    assert.strictEqual(h.channel.stops, 0);
+    assert.strictEqual(h.channel.sends.filter((s) => s.includes("监督警告")).length, 1, "不得重复警告");
+    assert.strictEqual(h.channel.sends.filter((s) => s.includes("监督暂停")).length, 0, "无信号复现不得暂停");
     const loaded = await loadOk(h.services.state, "w-test");
-    assert.strictEqual(loaded?.safetyWarningSent, true, "未改善时闩锁不得清除");
-    assert.strictEqual(loaded?.safetyWarningTrigger, "spin", "触发源应保持为 spin");
+    assert.strictEqual(loaded?.warningSent, true, "无干活证据时闩锁保持");
+    assert.strictEqual(loaded?.paused, false);
   });
 
-  it("残差 blocker 反向：警告后真实改善（信号消失+newToolCalls>0）→ 清闩不 stop，改善后 cursor-only beats 不重复警告", async () => {
-    // 真实改善（LIVE-1 口径）→ 清闩并继续进 decide；改善后的拍即使信号消失且
-    // newToolCalls=0 也不得 stop、不得再警告（每发一次警告只给一拍宽限，改善后
-    // 静止/无进展拍不得再 stop）。
-    const h = harness({ budgetMs: 60_000, target: new ImproveThenCursorOnlyTarget(spinSignals()) });
+  it("暂停待命语义：目标回应（游标前进，无新工具调用）不视为复工；新工具调用 → resumed（V2a）", async () => {
+    const target = new SpyTarget(spinSignals());
+    // call1 触发链起点；call2 复现 → 警告；call3 复现 → 暂停；call4-5 目标仅回应文本
+    // （游标前进、无新工具调用）→ 不复工；call6 新工具调用 → 复工
+    target.newToolCallsScript = (call) => (call === 1 || call === 6 ? 1 : 0);
+    const h = harness({ budgetMs: 1_000_000, target });
     h.channel.kind = "orca";
     h.channel.reads = [
-      { text: "a", cursor: "10", alive: true }, // 拍1：复现 → 最后警告（触发源 spin）
-      { text: "b", cursor: "20", alive: true }, // 拍2：信号消失+newToolCalls>0 → 真实改善 → 清闩
-      { text: "c", cursor: "30", alive: true }, // 拍3-5：cursor-only beats（信号消失、无新增调用）→ 不得 stop
-      { text: "d", cursor: "40", alive: true },
-      { text: "e", cursor: "50", alive: true },
+      { text: "a", cursor: "10", alive: true }, // 拍1：复现 → L2 警告
+      { text: "b", cursor: "20", alive: true }, // 拍2：复现 → 暂停
+      { text: "c", cursor: "30", alive: true }, // 拍3：回应但无工具调用 → 不复工
+      { text: "d", cursor: "40", alive: true }, // 拍4：仍无工具调用 → 不复工
+      { text: "e", cursor: "50", alive: true }, // 拍5：回应但无工具调用 → 不复工
+      { text: "f", cursor: "60", alive: true }, // 拍6：新工具调用 → 复工
+      "dead",
+      "dead",
+    ];
+    await seedEscalated(h);
+    const result = await runWatch(h.watchOpts, h.services);
+    assert.strictEqual(result.exitCode, 0);
+    assert.strictEqual(h.channel.stops, 0);
+    const evs = h.services.events.read("w-test");
+    assert.ok(evs.some((e) => e.type === "resumed"), "复工事件");
+    assert.ok(evs.filter((e) => e.type === "steer" && e.action === "pause").length === 1, "只暂停一次，不重复干预");
+    const loaded = await loadOk(h.services.state, "w-test");
+    assert.strictEqual(loaded?.paused, false, "复工后清闩");
+  });
+
+  it("崩溃恢复：warningSent 持久化 → 恢复后同游标 → 取证判复现 → 暂停待命（不再 stop）", async () => {
+    const h = harness({ budgetMs: 1_000_000, target: new SpyTarget(spinSignals()) });
+    h.channel.kind = "orca";
+    h.channel.reads = [
+      { text: "", cursor: "10", alive: true }, // 恢复：同游标 + warningSent → 取证 → 信号复现 → 暂停
+      "dead",
+      "dead",
     ];
     const state = await seedState(h);
-    state.remindCount = 1;
-    state.escalationCount = 1;
-    state.remindHistory = [{ kind: "spin", beat: 0, factsHash: signalKey(spinSignals()[0]!) }];
+    state.cursor = "10";
+    state.warningSent = true;
+    state.warningTrigger = "spin";
+    state.lastAction = "warning";
     await h.services.state.save("w-test", state);
     const result = await runWatch(h.watchOpts, h.services);
     assert.strictEqual(result.exitCode, 0);
-    assert.strictEqual(h.channel.stops, 0, "真实改善后不得 stop");
-    assert.strictEqual(h.channel.sends.filter((s) => s.includes("警告")).length, 1, "不得重复警告");
-    assert.strictEqual(h.target.calls, 5, "改善后继续正常取证（拍2-5 均走 decide）");
+    assert.strictEqual(h.channel.stops, 0, "恢复后不得 stop");
+    assert.strictEqual(h.target.calls, 1, "闩锁在身 → 同游标也取证一次");
     const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "safety-warning-cleared"));
+    assert.ok(evs.some((e) => e.type === "watch_resume"));
+    assert.ok(evs.some((e) => e.type === "escalated" && e.to === "pause"), "复现 → 暂停升级");
+    assert.ok(evs.some((e) => e.type === "steer" && e.action === "pause"));
     assert.ok(!evs.some((e) => e.type === "stop"));
-    const loaded = await loadOk(h.services.state, "w-test");
-    assert.strictEqual(loaded?.safetyWarningSent, false, "真实改善后闩锁必须清除并持久化");
-    assert.strictEqual(loaded?.safetyWarningTrigger, null, "清闩后触发源必须重置");
   });
 
-  it("警告后目标持续 alive+无进展 → 次拍必须 stop（B1：不依赖预算到期）", async () => {
-    const h = harness({ target: new SpyTarget(spinSignals()) }); // 预算 1000 分钟，未到期
+  it("空游标恢复 + warningSent → 取证判复现 → 暂停（不再 stop）", async () => {
+    const h = harness({ budgetMs: 1_000_000, target: new SpyTarget(spinSignals()) });
     h.channel.kind = "orca";
     h.channel.reads = [
-      { text: "a", cursor: "10", alive: true }, // 拍1：复现 → 安全网最后警告
-      { text: "", cursor: "10", alive: true }, // 拍2：游标不前进且仍 alive → 必须 stop
+      { text: "", cursor: "", alive: true }, // 空游标 + 警告在身 → 取证 → 复现 → 暂停
+      "dead",
+      "dead",
     ];
     const state = await seedState(h);
-    state.remindCount = 1;
-    state.escalationCount = 1;
-    state.remindHistory = [{ kind: "spin", beat: 0, factsHash: signalKey(spinSignals()[0]!) }];
+    state.cursor = "";
+    state.warningSent = true;
+    state.warningTrigger = "spin";
+    state.lastAction = "warning";
     await h.services.state.save("w-test", state);
     const result = await runWatch(h.watchOpts, h.services);
     assert.strictEqual(result.exitCode, 0);
-    assert.ok(h.channel.sends.some((s) => s.includes("警告")), "应先发最后警告");
-    assert.strictEqual(h.channel.stops, 1, "警告后次拍无进展必须 stop");
+    assert.strictEqual(h.channel.stops, 0);
+    assert.strictEqual(h.target.calls, 1, "闩锁在身 → 空游标也取证");
     const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "decide" && e.action === "safety-warning"));
-    assert.ok(evs.some((e) => e.type === "stop"));
-    assert.ok(evs.some((e) => e.type === "stop-issued"));
+    assert.ok(evs.some((e) => e.type === "escalated" && e.to === "pause"));
+    assert.ok(!evs.some((e) => e.type === "stop"));
   });
 
-  it("警告后同类信号复现（游标前进）→ 次拍 stop（B1 安全网承诺）", async () => {
-    const h = harness({ target: new SpyTarget(spinSignals()) });
+  it("取证持续失败（warning 在身）→ 连续上限后 degraded 收尾，不 stop（V2a）", async () => {
+    const h = harness({ budgetMs: 1_000_000, target: new BrokenTarget() });
     h.channel.kind = "orca";
-    h.channel.reads = [
-      { text: "a", cursor: "10", alive: true }, // 拍1：复现 → 最后警告
-      { text: "b", cursor: "20", alive: true }, // 拍2：同类信号复现 → 停止
-    ];
+    h.channel.reads = [{ text: "", cursor: "10", alive: true }];
     const state = await seedState(h);
-    state.remindCount = 1;
-    state.escalationCount = 1;
-    state.remindHistory = [{ kind: "spin", beat: 0, factsHash: signalKey(spinSignals()[0]!) }];
+    state.cursor = "10";
+    state.warningSent = true;
+    state.warningTrigger = "spin";
+    state.lastAction = "warning";
     await h.services.state.save("w-test", state);
     const result = await runWatch(h.watchOpts, h.services);
     assert.strictEqual(result.exitCode, 0);
-    assert.strictEqual(h.channel.stops, 1, "警告后同类信号复现必须 stop");
+    assert.strictEqual(h.channel.stops, 0, "取证失败不再触发 stop（stop 仅剩 L4）");
     const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "stop"));
+    assert.strictEqual(evs.filter((e) => e.type === "facts-error").length, MAX_CONSECUTIVE_FACTS_ERRORS);
+    assert.ok(evs.some((e) => e.type === "facts-error-exhausted"));
+    assert.ok(evs.some((e) => e.type === "finish" && String(e.reason).includes("连续取证失败超上限")));
   });
 
-  it("超预算 + 目标活跃（orca 通道）→ 最后警告 → 下一拍停止", async () => {
+  it("预算到期（busy + 无新输出）→ 监督者直接收尾退出：无警告、无停止（V2a 删除预算安全网）", async () => {
     const h = harness({ budgetMs: 10_000, target: new SpyTarget(spinSignals()) });
     h.channel.kind = "orca";
     h.channel.waitResults = ["timeout", "timeout"];
-    h.channel.reads = [
-      { text: "a", cursor: "10", alive: true },
-      { text: "b", cursor: "20", alive: true },
-    ];
+    h.channel.reads = [{ text: "a", cursor: "10", alive: true }];
     const result = await runWatch(h.watchOpts, h.services);
     assert.strictEqual(result.exitCode, 0);
-    assert.ok(h.channel.sends.some((s) => s.includes("警告")));
-    assert.strictEqual(h.channel.stops, 1);
+    assert.strictEqual(h.channel.sends.length, 0, "预算到期不得发任何警告");
+    assert.strictEqual(h.channel.stops, 0, "预算到期不得停止目标");
     const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "decide" && e.action === "safety-warning"));
-    assert.ok(evs.some((e) => e.type === "stop"));
-    assert.ok(evs.some((e) => e.type === "stop-issued"));
+    assert.ok(evs.some((e) => e.type === "budget-expired"));
+    assert.ok(evs.some((e) => e.type === "finish" && String(e.reason).includes("监督预算到期")));
+    assert.ok(!evs.some((e) => e.type === "decide" && e.action === "warning"), "预算到期不进决策树");
   });
 
-  it("超预算 + 活跃 → 最后警告 → 下一拍目标转静 → 停止后收尾（M2：安全网序列收完）", async () => {
-    const h = harness({ budgetMs: 10_000, target: new SpyTarget(spinSignals()) });
-    h.channel.kind = "orca";
-    h.channel.waitResults = ["timeout", "timeout"];
-    h.channel.reads = [
-      { text: "a", cursor: "10", alive: true }, // 活跃：超预算 → 最后警告
-      { text: "", cursor: "10", alive: true }, // 转静：无改善 → 必须 stop，不得直接收尾
-    ];
-    const result = await runWatch(h.watchOpts, h.services);
-    assert.strictEqual(result.exitCode, 0);
-    assert.ok(h.channel.sends.some((s) => s.includes("警告")));
-    assert.strictEqual(h.channel.stops, 1);
-    const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "stop"));
-    assert.ok(evs.some((e) => e.type === "stop-issued"));
-    const report = (await import("node:fs")).readFileSync(result.reportPath!, "utf-8");
-    assert.ok(report.includes("安全网收尾：最后警告后无改善，已停止"));
-  });
-
-  it("纯观察（file 通道）：提醒/警告/停止只记录事件，不发送任何消息", async () => {
+  it("纯观察（file 通道）：提醒/警告/暂停只记录事件，不发送任何消息", async () => {
     const h = harness({
       budgetMs: 100_000,
       target: new SpyTarget(spinSignals()),
@@ -701,21 +591,51 @@ describe("安全网与停止", () => {
     });
     h.channel.waitResults = ["idle", "timeout"];
     h.channel.reads = [
-      { text: "a", cursor: "10", alive: true },
-      { text: "b", cursor: "20", alive: true },
-      { text: "c", cursor: "30", alive: true },
+      { text: "a", cursor: "10", alive: true }, // 拍1：预算未到 → 机械提醒（只记录）
+      { text: "b", cursor: "20", alive: true }, // 拍2：wait 超时推进时钟 → 预算到期 → 收尾退出
     ];
     const result = await runWatch(h.watchOpts, h.services);
     assert.strictEqual(result.exitCode, 0);
     const evs = h.services.events.read("w-test");
-    // 拍 1：预算未到 → 机械提醒（只记录）
     assert.ok(evs.some((e) => e.type === "steer-unsupported" && e.action === "remind"));
-    // 拍 2：wait 超时推进时钟 → 超预算 → 警告（只记录）
-    assert.ok(evs.some((e) => e.type === "steer-unsupported" && e.action === "safety-warning"));
-    // 拍 3：停止（只记录，不实际停止）
-    assert.ok(evs.some((e) => e.type === "stop-unsupported"));
+    assert.ok(evs.some((e) => e.type === "budget-expired"), "纯观察模式预算到期同样只退出");
     assert.strictEqual(h.channel.sends.length, 0);
     assert.strictEqual(h.channel.stops, 0);
+  });
+
+  it("L4 硬边界命中 → 唯一 stop 路径：stop-issued + 升级事件置顶（V2a）", async () => {
+    const h = harness({ budgetMs: 1_000_000, target: new SpyTarget([]) });
+    h.channel.kind = "orca";
+    h.channel.reads = [{ text: "a", cursor: "10", alive: true }];
+    h.target.recentCommands = ["rm -rf /tmp/outside-data"]; // 工作区（/workspace）外删除
+    const result = await runWatch(h.watchOpts, h.services);
+    assert.strictEqual(result.exitCode, 0);
+    assert.strictEqual(h.channel.stops, 1, "L4 命中 → stop");
+    const evs = h.services.events.read("w-test");
+    assert.ok(evs.some((e) => e.type === "escalated" && e.to === "stop" && e.pinned === true), "升级事件置顶标记");
+    assert.ok(evs.some((e) => e.type === "stop"));
+    assert.ok(evs.some((e) => e.type === "stop-issued"));
+    assert.ok(evs.some((e) => e.type === "stop-verified"));
+    assert.ok(evs.some((e) => e.type === "finish" && String(e.reason).includes("L4")));
+  });
+
+  it("L4 无命中（工作区内删除）→ 不 stop，走正常干预链", async () => {
+    const h = harness({ budgetMs: 1_000_000, target: new SpyTarget(spinSignals()) });
+    h.channel.kind = "orca";
+    h.channel.reads = [
+      { text: "a", cursor: "10", alive: true },
+      { text: "b", cursor: "20", alive: true },
+      "dead",
+      "dead",
+    ];
+    h.target.recentCommands = ["rm -rf /workspace/proj/node_modules"];
+    await seedEscalated(h);
+    const result = await runWatch(h.watchOpts, h.services);
+    assert.strictEqual(result.exitCode, 0);
+    assert.strictEqual(h.channel.stops, 0, "工作区内删除不是硬边界");
+    const evs = h.services.events.read("w-test");
+    assert.ok(evs.some((e) => e.type === "decide" && e.action === "warning"), "正常走 L2 警告链");
+    assert.ok(!evs.some((e) => e.type === "stop"));
   });
 
   it("LLM 返回 panel → 暂停引导 → 执行讨论组 → 复工引导", async () => {
@@ -734,13 +654,7 @@ describe("安全网与停止", () => {
       "dead",
       "dead",
     ];
-    // 预置：同 key 已提醒过、升级计数 1 → 本次复现直接到 LLM 回调点
-    const state = await seedState(h);
-    state.remindCount = 1;
-    state.escalationCount = 1;
-    state.remindHistory = [{ kind: "spin", beat: 0, factsHash: signalKey(spinSignals()[0]!) }];
-    await h.services.state.save("w-test", state);
-
+    await seedEscalated(h);
     const result = await runWatch(h.watchOpts, h.services);
     assert.strictEqual(result.exitCode, 0);
     const evs = h.services.events.read("w-test");
@@ -765,11 +679,7 @@ describe("安全网与停止", () => {
       "dead",
       "dead",
     ];
-    const state = await seedState(h);
-    state.remindCount = 1;
-    state.escalationCount = 1;
-    state.remindHistory = [{ kind: "spin", beat: 0, factsHash: signalKey(spinSignals()[0]!) }];
-    await h.services.state.save("w-test", state);
+    await seedEscalated(h);
     const result = await runWatch(h.watchOpts, h.services);
     assert.strictEqual(result.exitCode, 0);
     const evs = h.services.events.read("w-test");
@@ -777,7 +687,6 @@ describe("安全网与停止", () => {
     assert.strictEqual(h.channel.sends.length, 0);
   });
 });
-
 describe("事件与状态落盘", () => {
   it("watch_start 事件、状态文件与汇报写入", async () => {
     const h = harness({ budgetMs: 10_000 });
@@ -790,6 +699,24 @@ describe("事件与状态落盘", () => {
     assert.ok(existsSync(join(h.dir, "reports", "w-test.md")));
     const report = await import("node:fs").then((fs) => fs.readFileSync(join(h.dir, "reports", "w-test.md"), "utf-8"));
     assert.ok(report.includes("监督汇报 w-test"));
+  });
+
+  it("V2a 任务契约流入：watchOpts.contract → 状态持久化 → 汇报头部", async () => {
+    const h = harness({ budgetMs: 10_000 });
+    h.channel.reads = [{ text: "a", cursor: "10", alive: true }];
+    h.watchOpts.contract = {
+      requirement: "实现 V2a 干预语义重排",
+      acceptance: ["预算到期监督者自己退出"],
+      scope: ["src/watcher"],
+      approvedDecisions: [],
+    };
+    const result = await runWatch(h.watchOpts, h.services);
+    assert.strictEqual(result.exitCode, 0);
+    const loaded = await loadOk(h.services.state, "w-test");
+    assert.strictEqual(loaded?.contract?.requirement, "实现 V2a 干预语义重排", "契约随状态持久化");
+    const report = await import("node:fs").then((fs) => fs.readFileSync(result.reportPath!, "utf-8"));
+    assert.ok(report.includes("## 任务契约"), "契约进汇报头部");
+    assert.ok(report.includes("预算到期监督者自己退出"), "验收标准进汇报");
   });
 
   it("崩溃恢复续跑：已有状态时从上次拍数继续", async () => {
@@ -814,30 +741,32 @@ describe("事件与状态落盘", () => {
 
 describe("取证与回调异常降级", () => {
   it("取证失败 → 本拍游标不变、落 facts-error，下拍重试（M3）", async () => {
-    // 纯 terminal 目标（无证据源）：警告在身的次拍走取证前直接 stop，不触发 M2 探针，
-    // 保证本用例专注验证 M3 重试纪律（同一检查点重试）。
-    const h = harness({ budgetMs: 10_000, target: new FlakyTarget(1, [], "terminal") });
-    h.channel.reads = [{ text: "a", cursor: "10", alive: true }];
+    const h = harness({ budgetMs: 1_000_000, target: new FlakyTarget(1, [], "terminal") });
+    h.channel.reads = [
+      { text: "a", cursor: "10", alive: true },
+      { text: "b", cursor: "20", alive: true },
+      "dead",
+      "dead",
+    ];
     const result = await runWatch(h.watchOpts, h.services);
     assert.strictEqual(result.exitCode, 0);
-    // 失败那拍游标不变（仍 ""），下拍用同一检查点重试；成功后状态游标推进到通道游标 "10"
+    // 失败那拍游标不变（仍 ""），下拍用同一检查点重试；成功后状态游标推进到通道游标 "20"
     assert.deepStrictEqual(h.target.cursors, ["", ""]);
     const evs = h.services.events.read("w-test");
     assert.ok(evs.some((e) => e.type === "facts-error"));
     const loaded = await loadOk(h.services.state, "w-test");
-    assert.strictEqual(loaded?.cursor, "10");
+    assert.strictEqual(loaded?.cursor, "20");
   });
 
-  it("永久取证异常 + 预算到期 → 汇报退出：finish 事件 + 进程正常结束（B2）", async () => {
+  it("永久取证异常 + 预算到期 → 预算收尾退出（V2a：预算到期只退出，不动目标）", async () => {
     const h = harness({ budgetMs: 10_000, target: new BrokenTarget() });
     h.channel.reads = [{ text: "a", cursor: "10", alive: true }];
     const result = await runWatch(h.watchOpts, h.services);
     assert.strictEqual(result.exitCode, 0);
     const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "finish"), "必须有 finish 事件");
+    assert.ok(evs.some((e) => e.type === "facts-error"), "取证失败已记录");
     const finishEv = evs.find((e) => e.type === "finish");
-    assert.ok(finishEv !== undefined && String(finishEv["reason"]).includes("取证"), "收尾原因应标注取证失败");
-    assert.ok(evs.some((e) => e.type === "facts-error-exhausted"));
+    assert.ok(finishEv !== undefined && String(finishEv["reason"]).includes("监督预算到期"), "收尾原因 = 预算到期退出");
     assert.ok(result.reportPath !== null && existsSync(result.reportPath), "应写完工汇报");
   });
 
@@ -867,8 +796,11 @@ describe("取证与回调异常降级", () => {
     ];
     const state = await seedState(h);
     state.remindCount = 1;
-    state.escalationCount = 1;
-    state.remindHistory = [{ kind: "spin", beat: 0, factsHash: signalKey(spinSignals()[0]!) }];
+    const key = signalKey(spinSignals()[0]!);
+    state.remindHistory = [
+      { kind: "spin", beat: 0, factsHash: key },
+      { kind: "spin", beat: 5, factsHash: key },
+    ];
     await h.services.state.save("w-test", state);
 
     const result = await runWatch(h.watchOpts, h.services);
@@ -886,7 +818,7 @@ describe("取证与回调异常降级", () => {
     h.channel.reads = [{ text: "a", cursor: "10", alive: true }];
     const result = await runWatch(h.watchOpts, h.services);
     const report = (await import("node:fs")).readFileSync(result.reportPath!, "utf-8");
-    assert.ok(report.includes("预算到期，目标静止"), "报告应显示实际收尾原因");
+    assert.ok(report.includes("监督预算到期"), "报告应显示实际收尾原因");
     assert.ok(!report.includes("未记录收尾事件"), "报告不得误显未记录收尾事件");
   });
 
@@ -895,8 +827,8 @@ describe("取证与回调异常降级", () => {
     h.channel.reads = [{ text: "a", cursor: "10", alive: true }];
     const result = await runWatch(h.watchOpts, h.services);
     const report = (await import("node:fs")).readFileSync(result.reportPath!, "utf-8");
-    assert.ok(report.includes("原地重复"), "报告应统计实际触发的信号种类");
-    assert.ok(!report.includes("（无）"), "有信号时不得误显无信号");
+    assert.ok(report.includes("原地重复：1 次"), "报告应统计实际触发的信号种类");
+    assert.ok(!report.includes("（无，全程沉默观察）"), "有信号时不得误显无动作");
   });
 });
 
@@ -943,8 +875,8 @@ describe("B1 不可达目标收尾", () => {
   });
 });
 
-describe("B2 预算安全网误判", () => {
-  it("busy + 无新输出 + 预算到期（waitIdle timeout）→ 最后警告 → 停止 → 收尾", async () => {
+describe("B2 预算到期语义（V2a：只退出，不动目标）", () => {
+  it("busy + 无新输出 + 预算到期（waitIdle timeout）→ 直接收尾退出，无警告无停止", async () => {
     const h = harness({ budgetMs: 1_000_000, target: new SpyTarget() });
     h.channel.kind = "orca";
     h.channel.waitResults = ["timeout", "timeout", "timeout"];
@@ -955,112 +887,124 @@ describe("B2 预算安全网误判", () => {
     ];
     const result = await runWatch(h.watchOpts, h.services);
     assert.strictEqual(result.exitCode, 0);
-    // 必须出现最后警告与 stop（不得当"目标静止"直接收尾）
-    assert.ok(h.channel.sends.some((s) => s.includes("警告")), "应发出最后警告");
-    assert.strictEqual(h.channel.stops, 1, "应执行 stop");
+    assert.strictEqual(h.channel.sends.length, 0, "预算到期不得发任何警告");
+    assert.strictEqual(h.channel.stops, 0, "预算到期不得停止目标");
     const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "stop"));
-    assert.ok(evs.some((e) => e.type === "stop-issued"));
-    assert.ok(!evs.some((e) => e.type === "budget-expired-idle"), "busy 目标不得走静止直接收尾");
+    assert.ok(evs.some((e) => e.type === "budget-expired"), "统一预算到期事件");
+    assert.ok(evs.some((e) => e.type === "finish" && String(e.reason).includes("监督预算到期")));
+  });
+
+  it("预算到期时警告/暂停闩锁在身 → 同样直接收尾退出（不追加干预）", async () => {
+    const h = harness({ budgetMs: 10_000, target: new SpyTarget(spinSignals()) });
+    h.channel.kind = "orca";
+    h.channel.waitResults = ["timeout"];
+    h.channel.reads = [{ text: "a", cursor: "10", alive: true }];
+    const state = await seedState(h);
+    state.warningSent = true;
+    state.warningTrigger = "spin";
+    state.lastAction = "warning";
+    await h.services.state.save("w-test", state);
+    const result = await runWatch(h.watchOpts, h.services);
+    assert.strictEqual(result.exitCode, 0);
+    assert.strictEqual(h.channel.sends.length, 0);
+    assert.strictEqual(h.channel.stops, 0);
+    const evs = h.services.events.read("w-test");
+    assert.ok(evs.some((e) => e.type === "budget-expired"));
   });
 });
 
-describe("M2 会话适配器无进展探针（--terminal + --session 组合）", () => {
-  /** 预置：崩溃前最后警告已发出且成功取证到游标 <cursor>。 */
+describe("V2a 警告闩锁会话适配器（--terminal + --session 组合）", () => {
+  /** 预置：崩溃前 L2 警告已发出且成功取证到游标 <cursor>。 */
   async function seedWarning(h: ReturnType<typeof harness>, cursor: string): Promise<void> {
     const state = await seedState(h);
     state.cursor = cursor;
-    state.safetyWarningSent = true;
-    state.lastAction = "safety-warning";
+    state.warningSent = true;
+    state.warningTrigger = "spin";
+    state.lastAction = "warning";
     await h.services.state.save("w-test", state);
   }
 
-  it("LIVE-1 预算触发恢复：trigger=budget 持久化 → 会话文件有新增调用也清不了闩 → 必须 stop", async () => {
-    // 崩溃恢复不得绕过安全网承诺：预算到期触发的警告永不改善（预算单调不消失），
-    // 即使会话文件探针显示 newToolCalls>0 也必须 stop，不得旧 M2 语义清闩续跑。
-    const h = harness({ budgetMs: 1_000_000, target: new SpyTarget([], "pi") });
-    h.channel.kind = "orca";
-    h.channel.reads = [{ text: "", cursor: "10", alive: true }]; // 同游标 + 警告在身 → M2 探针（newToolCalls=1）→ 仍 stop
-    const state = await seedState(h);
-    state.cursor = "10";
-    state.safetyWarningSent = true;
-    state.safetyWarningTrigger = "budget";
-    state.lastAction = "safety-warning";
-    await h.services.state.save("w-test", state);
-    const result = await runWatch(h.watchOpts, h.services);
-    assert.strictEqual(result.exitCode, 0);
-    assert.strictEqual(h.channel.stops, 1, "预算触发永不改善 → 探针有新增调用也必须 stop");
-    assert.strictEqual(h.target.calls, 1, "探针取证一次");
-    const evs = h.services.events.read("w-test");
-    assert.ok(!evs.some((e) => e.type === "safety-warning-cleared"));
-    assert.ok(evs.some((e) => e.type === "stop"));
-    assert.ok(evs.some((e) => e.type === "stop-issued"));
-    const loaded = await loadOk(h.services.state, "w-test");
-    assert.strictEqual(loaded?.safetyWarningTrigger, "budget", "触发源应持久化（崩溃续跑不丢）");
-  });
-
-  it("警告在身 + 终端游标不变 + 会话文件新增调用 → 不 stop 且清闩", async () => {
-    const h = harness({ budgetMs: 60_000, target: new SpyTarget([], "pi") });
+  it("警告在身 + 终端游标不变 + 会话文件信号复现 → 暂停待命（不 stop）", async () => {
+    const h = harness({ budgetMs: 1_000_000, target: new SpyTarget(spinSignals(), "pi") });
     h.channel.kind = "orca";
     h.channel.reads = [
-      { text: "", cursor: "10", alive: true }, // 拍1：同游标 + 警告在身 → M2 探针（首次取证 newToolCalls=1）→ 清闩
-      { text: "", cursor: "10", alive: true }, // 拍2：清闩后无进展拍 → 预算到期（目标静止）→ 收尾
-    ];
-    await seedWarning(h, "10");
-    const result = await runWatch(h.watchOpts, h.services);
-    assert.strictEqual(result.exitCode, 0);
-    assert.strictEqual(h.channel.stops, 0, "会话文件有新增调用（newToolCalls>0）→ 不得 stop");
-    assert.strictEqual(h.target.calls, 1, "只做一次 M2 探针取证");
-    const loaded = await loadOk(h.services.state, "w-test");
-    assert.strictEqual(loaded?.safetyWarningSent, false, "判定改善后闩锁必须清除并持久化");
-    const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "safety-warning-cleared"));
-    assert.ok(!evs.some((e) => e.type === "stop"));
-    assert.ok(evs.some((e) => e.type === "finish" && String(e.reason).includes("预算到期，目标静止")));
-  });
-
-  it("警告在身 + 游标不变 + 会话文件无新增调用 → 探针一次后 stop", async () => {
-    const h = harness({ budgetMs: 1_000_000, target: new NoNewToolCallsTarget() });
-    h.channel.kind = "orca";
-    h.channel.reads = [
-      { text: "", cursor: "10", alive: true },
-      { text: "", cursor: "10", alive: true },
-    ];
-    await seedWarning(h, "10");
-    const result = await runWatch(h.watchOpts, h.services);
-    assert.strictEqual(result.exitCode, 0);
-    assert.strictEqual(h.channel.stops, 1, "探针无新增调用 → 必须 stop");
-    assert.strictEqual(h.target.calls, 1, "先取证一次再判（M2 探针）");
-    const loaded = await loadOk(h.services.state, "w-test");
-    assert.strictEqual(loaded?.safetyWarningSent, true, "未改善时闩锁不得清除");
-    const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "stop"));
-    assert.ok(evs.some((e) => e.type === "stop-issued"));
-    assert.ok(!evs.some((e) => e.type === "safety-warning-cleared"));
-  });
-
-  it("空游标恢复 + 会话适配器：探针 newToolCalls>0 → 不 stop 且清闩（B2 分支）", async () => {
-    const h = harness({ budgetMs: 1_000_000, target: new SpyTarget([], "pi") });
-    h.channel.kind = "orca";
-    h.channel.reads = [
-      { text: "", cursor: "", alive: true }, // 拍1：空游标 + 警告在身 → M2 探针（newToolCalls=1）→ 清闩，sleep 进下一拍
-      { text: "", cursor: "", alive: true }, // 拍2：清闩后游标仍空 → 正常取证（calls=2）→ silence
+      { text: "", cursor: "10", alive: true }, // 同游标 + 警告在身 → 闩锁取证 → 信号复现 → 暂停
+      { text: "", cursor: "10", alive: true }, // 暂停中 → 沉默
       "dead",
-      "dead", // 拍3-4：不可达 → 收尾（保证循环终止）
+      "dead",
+    ];
+    await seedWarning(h, "10");
+    const result = await runWatch(h.watchOpts, h.services);
+    assert.strictEqual(result.exitCode, 0);
+    assert.strictEqual(h.channel.stops, 0, "会话适配器同样不 stop（stop 仅剩 L4）");
+    assert.strictEqual(h.target.calls, 2, "闩锁在身 → 同游标也取证（暂停后拍仍取证）");
+    const evs = h.services.events.read("w-test");
+    assert.ok(evs.some((e) => e.type === "escalated" && e.to === "pause"), "复现 → 暂停升级");
+    assert.ok(!evs.some((e) => e.type === "stop"));
+    const loaded = await loadOk(h.services.state, "w-test");
+    assert.strictEqual(loaded?.paused, true);
+  });
+
+  it("警告在身 + 终端游标不变 + 会话文件信号消失且有新增调用 → 确认清闩（不 stop）", async () => {
+    const h = harness({ budgetMs: 1_000_000, target: new SpyTarget([], "pi") });
+    h.channel.kind = "orca";
+    h.channel.reads = [
+      { text: "", cursor: "10", alive: true }, // 同游标 + 警告在身 → 闩锁取证：信号消失 + newToolCalls=1 → 确认
+      "dead",
+      "dead",
+    ];
+    await seedWarning(h, "10");
+    const result = await runWatch(h.watchOpts, h.services);
+    assert.strictEqual(result.exitCode, 0);
+    assert.strictEqual(h.channel.stops, 0);
+    assert.strictEqual(h.target.calls, 1);
+    const loaded = await loadOk(h.services.state, "w-test");
+    assert.strictEqual(loaded?.warningSent, false, "确认后闩锁清除并持久化");
+    const evs = h.services.events.read("w-test");
+    assert.ok(evs.some((e) => e.type === "warning-acked"));
+    assert.ok(!evs.some((e) => e.type === "stop"));
+  });
+
+  it("警告在身 + 游标不变 + 会话文件无新增调用且信号消失 → 沉默等待（不 stop）", async () => {
+    const h = harness({ budgetMs: 1_000_000, target: new NoNewToolCallsTarget([], "pi") });
+    h.channel.kind = "orca";
+    h.channel.reads = [
+      { text: "", cursor: "10", alive: true },
+      { text: "", cursor: "10", alive: true },
+      "dead",
+      "dead",
+    ];
+    await seedWarning(h, "10");
+    const result = await runWatch(h.watchOpts, h.services);
+    assert.strictEqual(result.exitCode, 0);
+    assert.strictEqual(h.channel.stops, 0, "无干活证据不 stop（V2a：等待而非停止）");
+    const loaded = await loadOk(h.services.state, "w-test");
+    assert.strictEqual(loaded?.warningSent, true, "闩锁保持");
+    const evs = h.services.events.read("w-test");
+    assert.ok(!evs.some((e) => e.type === "stop"));
+  });
+
+  it("空游标恢复 + 会话适配器：信号消失且有新增调用 → 确认清闩（不 stop）", async () => {
+    const h = harness({ budgetMs: 1_000_000, target: new SpyTarget([], "pi") });
+    h.channel.kind = "orca";
+    h.channel.reads = [
+      { text: "", cursor: "", alive: true }, // 空游标 + 警告在身 → 闩锁取证 → 确认清闩
+      { text: "", cursor: "", alive: true }, // 清闩后游标仍空 → 正常取证（calls=2）→ silence
+      "dead",
+      "dead",
     ];
     await seedWarning(h, "");
     const result = await runWatch(h.watchOpts, h.services);
     assert.strictEqual(result.exitCode, 0);
-    assert.strictEqual(h.channel.stops, 0, "会话文件有新增调用 → 不得 stop");
-    assert.strictEqual(h.target.calls, 2, "探针 1 次 + 清闩后正常取证 1 次");
+    assert.strictEqual(h.channel.stops, 0);
+    assert.strictEqual(h.target.calls, 1, "确认清闩后同游标拍按游标纪律跳过取证");
     const loaded = await loadOk(h.services.state, "w-test");
-    assert.strictEqual(loaded?.safetyWarningSent, false, "判定改善后闩锁必须清除并持久化");
+    assert.strictEqual(loaded?.warningSent, false, "确认后闩锁清除并持久化");
     const evs = h.services.events.read("w-test");
-    assert.ok(evs.some((e) => e.type === "safety-warning-cleared"));
+    assert.ok(evs.some((e) => e.type === "warning-acked"));
     assert.ok(!evs.some((e) => e.type === "stop"));
   });
 });
-
 describe("M3 空游标边界", () => {
   it("首拍取证失败且游标为空 → 次拍必须重试取证（取证调用次数 ≥2）", async () => {
     const h = harness({ budgetMs: 120_000, target: new FlakyTarget(1) });
@@ -1080,8 +1024,11 @@ describe("B3 LLM 文案红线（loop 层）", () => {
   async function seedEscalated(h: ReturnType<typeof harness>): Promise<void> {
     const state = await seedState(h);
     state.remindCount = 1;
-    state.escalationCount = 1;
-    state.remindHistory = [{ kind: "spin", beat: 0, factsHash: signalKey(spinSignals()[0]!) }];
+    const key = signalKey(spinSignals()[0]!);
+    state.remindHistory = [
+      { kind: "spin", beat: 0, factsHash: key },
+      { kind: "spin", beat: 5, factsHash: key },
+    ];
     await h.services.state.save("w-test", state);
   }
 
@@ -1194,13 +1141,10 @@ describe("M3 append 失败传播（steer/stop 路径统一包装）", () => {
   });
 
   it("stop 路径 append 失败 → 标记 eventsDegraded → 报告显式标注", async () => {
-    const h = harness({ budgetMs: 10_000, target: new SpyTarget() });
+    const h = harness({ budgetMs: 1_000_000, target: new SpyTarget() });
     h.channel.kind = "orca";
-    h.channel.waitResults = ["timeout", "timeout"];
-    h.channel.reads = [
-      { text: "a", cursor: "10", alive: true },
-      { text: "b", cursor: "20", alive: true },
-    ];
+    h.channel.reads = [{ text: "a", cursor: "10", alive: true }];
+    h.target.recentCommands = ["rm -rf /tmp/outside-data"]; // V2a：L4 硬边界触发 stop
     // 只让 stop 事件落盘失败（stop 是收尾拍，观察报告标注而非状态文件）
     const store = h.services.events;
     const origAppend = store.append.bind(store);
@@ -1233,11 +1177,11 @@ describe("T2 finish 丢锁回归（收尾归属校验）", () => {
     h.channel.reads = [{ text: "a", cursor: "10", alive: true }];
     const store = h.services.state;
     const origLeaseWinner = store.leaseWinner.bind(store);
-    // 收尾归属校验探针：仅当收尾触发事件（budget-expired-idle）已落盘后，让
+    // 收尾归属校验探针：仅当收尾触发事件（budget-expired）已落盘后，让
     // leaseWinner 返回"他人"——模拟 finish 期间锁已被其他进程接管（真实场景：
     // 本运行租约过期/断链后他人 claim 当选）。收尾前的续租调用不受影响。
     store.leaseWinner = ((watchId: string, now: number) => {
-      if (h.services.events.read("w-test").some((e) => e.type === "budget-expired-idle")) {
+      if (h.services.events.read("w-test").some((e) => e.type === "budget-expired")) {
         return { runId: "run-other", ownerPid: 999_999, leaseExpiresAt: Number.MAX_SAFE_INTEGER };
       }
       return origLeaseWinner(watchId, now);

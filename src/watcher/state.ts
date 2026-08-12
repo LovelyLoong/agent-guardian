@@ -2,8 +2,12 @@
  * agent-guardian — watcher 状态机。
  *
  * {settledBeats, cursor, cooldownUntil, remindCount, remindHistory,
- *  escalationCount, llmCalls, startedAt, budget}，每拍原子落盘
+ *  escalationCount（纯统计，不作触发）, settledIncidents, llmCalls,
+ *  startedAt, budget}，每拍原子落盘
  * （tmp + rename），崩溃恢复续跑。
+ * V2a 新增：warningSent/warningTrigger（L2 警告闩锁，取代 V1 的
+ * safetyWarningSent/safetyWarningTrigger，旧字段名映射继承）、
+ * paused/pauseTrigger（暂停待命闩锁，复工需新工具调用）、contract（任务契约）。
  *
  * V1.1 运行代际/租约/单例（state 文件保持稳定名 <watchId>.json，历史按
  * watchRunId + generation 字段区分）：
@@ -38,6 +42,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import type { TaskContract } from "./contract.ts";
+import { isTaskContract } from "./contract.ts";
 import {
   appendFileSyncRetry,
   isTransientIoError,
@@ -215,13 +221,29 @@ export interface WatchState {
   cooldownUntil: Record<string, number>;
   remindCount: number;
   remindHistory: RemindHistoryEntry[];
+  /**
+   * 复现总累计（纯统计：进报告/证据包；V2b 起不作触发条件——
+   * 升级阶梯按 incident（signalKey=kind+factsHash）判定，见 decide.ts）。
+   */
   escalationCount: number;
+  /**
+   * 阶梯已到 pause 封顶的 incident key（signalKey=kind+factsHash，V2b）：
+   * 该 incident 不再重复提醒/升级（只记录）；不同 incident 互不影响彼此阶梯。
+   */
+  settledIncidents: string[];
   llmCalls: number;
   startedAt: number;
   budgetMs: number;
-  safetyWarningSent: boolean;
-  /** 安全网警告触发源（LIVE-1）："budget"=预算到期；否则为触发警告的信号 kind；null=未发警告 */
-  safetyWarningTrigger: string | null;
+  /** L2 警告闩锁（V2a：提醒复现后的"需要回应"警告；取代 V1 安全网警告闩锁） */
+  warningSent: boolean;
+  /** L2 警告触发信号 kind（"spin"/"stall"/...）；null=未发警告 */
+  warningTrigger: string | null;
+  /** 暂停待命闩锁（V2a：警告未确认且信号复现 → pause；复工需新工具调用） */
+  paused: boolean;
+  /** 暂停触发 incident key（signalKey=kind:factsHash，与 settledIncidents 同源一致）；null=未暂停 */
+  pauseTrigger: string | null;
+  /** 任务契约（--contract 挂载，不可变；无契约时 null） */
+  contract: TaskContract | null;
   /** 事件落盘曾失败（append 返回 false）：报告须显式标注，不静默当已记录 */
   eventsDegraded: boolean;
   targetKind: string;
@@ -238,6 +260,8 @@ export interface NewStateInput {
   channelKind: "file" | "orca";
   handle: string;
   sessionFile: string | null;
+  /** 任务契约（--contract 挂载，不可变；无契约时 null） */
+  contract?: TaskContract | null;
   now: number;
   /** 缺省=新生成 */
   watchRunId?: string;
@@ -261,11 +285,15 @@ export function initialState(input: NewStateInput): WatchState {
     remindCount: 0,
     remindHistory: [],
     escalationCount: 0,
+    settledIncidents: [],
     llmCalls: 0,
     startedAt: input.now,
     budgetMs: input.budgetMs,
-    safetyWarningSent: false,
-    safetyWarningTrigger: null,
+    warningSent: false,
+    warningTrigger: null,
+    paused: false,
+    pauseTrigger: null,
+    contract: input.contract ?? null,
     eventsDegraded: false,
     targetKind: input.targetKind,
     channelKind: input.channelKind,
@@ -578,14 +606,18 @@ export class StateStore {
   }
 }
 
+/** 读取可能含旧字段名的未知形状字段（V1 状态兼容）。 */
+function legacyField(parsed: Partial<WatchState>, key: string): unknown {
+  return (parsed as Record<string, unknown>)[key];
+}
+
 /**
  * 对加载的状态做字段级防御：缺字段补默认、类型错误置默认。
  * 旧版本状态文件（无 watchRunId 等新字段）→ 按 legacy 处理：
  * watchRunId="legacy"、status=finished——启动裁决视其为新任务，
  * 不继承无可验证属主/租约的旧计数（安全侧）。
  */
-function normalizeState(parsed: Partial<WatchState>, watchId: string): WatchState | null {
-  if (typeof parsed.startedAt !== "number" || !Number.isFinite(parsed.startedAt)) return null;
+function normalizeState(parsed: Partial<WatchState>, watchId: string): WatchState | null {  if (typeof parsed.startedAt !== "number" || !Number.isFinite(parsed.startedAt)) return null;
   const budgetMs = typeof parsed.budgetMs === "number" && Number.isFinite(parsed.budgetMs) ? parsed.budgetMs : 0;
   const legacy = typeof parsed.watchRunId !== "string" || parsed.watchRunId === "";
   return {
@@ -603,11 +635,23 @@ function normalizeState(parsed: Partial<WatchState>, watchId: string): WatchStat
     remindCount: typeof parsed.remindCount === "number" ? parsed.remindCount : 0,
     remindHistory: Array.isArray(parsed.remindHistory) ? parsed.remindHistory : [],
     escalationCount: typeof parsed.escalationCount === "number" ? parsed.escalationCount : 0,
+    settledIncidents: Array.isArray(parsed.settledIncidents)
+      ? parsed.settledIncidents.filter((s): s is string => typeof s === "string")
+      : [],
     llmCalls: typeof parsed.llmCalls === "number" ? parsed.llmCalls : 0,
     startedAt: parsed.startedAt,
     budgetMs,
-    safetyWarningSent: parsed.safetyWarningSent === true,
-    safetyWarningTrigger: typeof parsed.safetyWarningTrigger === "string" ? parsed.safetyWarningTrigger : null,
+    // V2a：新字段 warningSent/warningTrigger 取代旧 safetyWarningSent/safetyWarningTrigger；
+    // 旧字段名（V1 状态崩溃恢复）映射继承，不丢闩锁。
+    warningSent: parsed.warningSent === true || legacyField(parsed, "safetyWarningSent") === true,
+    warningTrigger: typeof parsed.warningTrigger === "string"
+      ? parsed.warningTrigger
+      : typeof legacyField(parsed, "safetyWarningTrigger") === "string"
+        ? (legacyField(parsed, "safetyWarningTrigger") as string)
+        : null,
+    paused: parsed.paused === true,
+    pauseTrigger: typeof parsed.pauseTrigger === "string" ? parsed.pauseTrigger : null,
+    contract: isTaskContract(parsed.contract) ? parsed.contract : null,
     eventsDegraded: parsed.eventsDegraded === true,
     targetKind: typeof parsed.targetKind === "string" ? parsed.targetKind : "pi",
     channelKind: parsed.channelKind === "orca" ? "orca" : "file",

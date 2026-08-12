@@ -23,6 +23,8 @@ import { withTransientRetry } from "../shared/fs.ts";
 
 const TAIL_SUMMARY_CHARS = 800;
 const TASK_SUMMARY_CHARS = 500;
+/** L4 传感：保留的最近命令条数（V2a） */
+const RECENT_COMMANDS_MAX = 3;
 
 export class PiAdapter implements TargetAdapter {
   readonly kind = "pi" as const;
@@ -32,6 +34,8 @@ export class PiAdapter implements TargetAdapter {
   private parsedBytes = 0;
   private lastSize = 0;
   private lastTotal = 0;
+  /** 最近执行的 bash 命令文本（按时间正序追加，最新在末尾） */
+  private recentCommands: string[] = [];
 
   constructor(file: string) {
     this.file = file;
@@ -48,6 +52,7 @@ export class PiAdapter implements TargetAdapter {
           toolCallsSeen: -1,
           newToolCalls: 0,
           signals: [],
+          recentCommands: [],
           tailSummary: "(会话文件不可读)",
         },
         cursor: cursor ?? "",
@@ -66,6 +71,7 @@ export class PiAdapter implements TargetAdapter {
       this.parsedBytes = 0;
       this.entries = [];
       this.lastTotal = 0;
+      this.recentCommands = [];
     }
     this.lastSize = size;
     let endOfLastCompleteLine = 0;
@@ -91,6 +97,7 @@ export class PiAdapter implements TargetAdapter {
     }
 
     this.entries.push(...newEntries);
+    this.collectCommands(newEntries);
 
     const toolCalls = extractToolCallsFromBranch(this.entries);
     const total = toolCalls.length;
@@ -109,11 +116,33 @@ export class PiAdapter implements TargetAdapter {
         toolCallsSeen: total,
         newToolCalls,
         signals,
+        recentCommands: [...this.recentCommands],
         tailSummary: tailOf(this.entries, TAIL_SUMMARY_CHARS),
         taskSummary: lastUserMessage(this.entries, TASK_SUMMARY_CHARS),
       },
       cursor: cursor ?? String(this.parsedBytes),
     };
+  }
+
+  /** L4 传感：从新增条目收集 bash 工具调用命令（V2a）。 */
+  private collectCommands(newEntries: SessionEntry[]): void {
+    for (const entry of newEntries) {
+      if (entry.type !== "message") continue;
+      const msg = entry.message;
+      if (msg === undefined || msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+      for (const block of msg.content) {
+        const b = block as Record<string, unknown>;
+        if (b["type"] !== "toolCall") continue;
+        if (b["name"] !== "bash" && b["name"] !== "shell") continue;
+        const args = (b["arguments"] ?? {}) as Record<string, unknown>;
+        const cmd = args["command"];
+        if (typeof cmd !== "string" || cmd.trim() === "") continue;
+        this.recentCommands.push(cmd);
+        if (this.recentCommands.length > RECENT_COMMANDS_MAX) {
+          this.recentCommands.shift();
+        }
+      }
+    }
   }
 }
 

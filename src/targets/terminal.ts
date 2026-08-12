@@ -18,6 +18,7 @@ export class TerminalAdapter implements TargetAdapter {
         toolCallsSeen: -1,
         newToolCalls: 0,
         signals: [],
+        recentCommands: [],
         tailSummary: "(未提供会话文件，仅活性监控)",
       },
       cursor: cursor ?? "",

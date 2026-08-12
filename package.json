@@ -1,6 +1,6 @@
 {
   "name": "agent-guardian",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "通用跨 CLI 运行期监督与讨论组编排（Node 零运行时依赖，type-stripping 直跑 .ts）",

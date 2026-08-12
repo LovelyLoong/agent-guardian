@@ -295,6 +295,30 @@ describe("CLI 子进程退出码（临时 AGENT_GUARDIAN_HOME）", () => {
     assert.ok(res.stdout.includes("记录降级"), "聚合输出应对 degraded 显式提示");
   });
 
+  it("V2a 升级事件（pinned）在事件流中置顶输出（--watch 模式）", () => {
+    const home = mkdtempSync(join(tmpdir(), "ag-cli-"));
+    mkdirSync(join(home, "events"), { recursive: true });
+    writeFileSync(
+      join(home, "events", "w-pin.jsonl"),
+      [
+        '{"ts":"2026-01-01T00:01:00.000Z","watchId":"w-pin","type":"watch_start"}',
+        '{"ts":"2026-01-01T00:02:00.000Z","watchId":"w-pin","type":"decide","action":"warning","ackRequired":true,"signals":["spin"]}',
+        '{"ts":"2026-01-01T00:03:00.000Z","watchId":"w-pin","type":"escalated","to":"pause","trigger":"spin","pinned":true,"reason":"WARNING 未获确认且信号复现"}',
+      ].join("\n") + "\n",
+      "utf-8",
+    );
+    const res = spawnSync(process.execPath, [cli, "events", "--watch", "w-pin"], {
+      encoding: "utf-8",
+      env: { ...process.env, AGENT_GUARDIAN_HOME: home },
+    });
+    assert.strictEqual(res.status, 0);
+    const lines = res.stdout.trim().split(/\r?\n/);
+    assert.strictEqual(lines.length, 3);
+    const first = JSON.parse(lines[0]!) as { type: string; pinned?: boolean };
+    assert.strictEqual(first.type, "escalated", "升级事件应置顶输出");
+    assert.strictEqual(first.pinned, true);
+  });
+
   it("未知命令 → 退出 2", () => {
     assert.strictEqual(run(["frobnicate"]).status, 2);
   });
@@ -352,8 +376,8 @@ describe("CLI 子进程退出码（临时 AGENT_GUARDIAN_HOME）", () => {
         llmCalls: 0,
         startedAt: Date.now() - 1_000,
         budgetMs: 120_000,
-        safetyWarningSent: false,
-        safetyWarningTrigger: null,
+        warningSent: false,
+        warningTrigger: null,
         eventsDegraded: false,
         targetKind: "pi",
         channelKind: "file",

@@ -1,18 +1,20 @@
 /**
  * agent-guardian — 跨进程 barrier 选举探针（测试专用）。
  *
- * 用法：node barrier-claim.ts <stateDir> <watchId> <readyDir> <goFile> <resultFile> <total>
+ * 用法：node barrier-claim.ts <stateDir> <watchId> <readyDir> <goFile> <resultFile> <doneFile>
  * 流程：① 以与 StateStore 相同的账本行格式 O_APPEND 追加自己的 claim 行；
  * ② 写就绪文件 <readyDir>/<pid>；③ 轮询等待主进程写 go 文件；
  * ④ 所有 claim 齐集后同时求值 leaseWinner → 向 <resultFile> 上报一行
- *    <pid>|<runId>|<winnerRunId>；⑤ 自认胜者保持存活直到 <resultFile> 凑齐
- *    <total> 行（全部上报完），非胜者立即退出。
+ *    <pid>|<runId>|<winnerRunId>；⑤ 自认胜者等待主进程写 done 文件后才退出
+ *    （done 屏障：主进程在全部结果齐集后写 done——胜者存活窗口由主进程显式
+ *    收束，不依赖读并发追加中的 resultFile 行数，Windows 并发读不稳不再
+ *    影响持有判定），非胜者上报后即退。
  * 零网络/Orca 依赖；仅用本地账本文件。
  *
  * @module
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { StateStore, LEASE_MS } from "../../src/watcher/state.ts";
 
@@ -22,7 +24,7 @@ const watchId = args[1] ?? "";
 const readyDir = args[2] ?? "";
 const goFile = args[3] ?? "";
 const resultFile = args[4] ?? "";
-const total = Number(args[5] ?? "0");
+const doneFile = args[5] ?? "";
 
 const runId = `barrier-${process.pid}-${Date.now().toString(36)}`;
 const now = Date.now();
@@ -49,24 +51,15 @@ while (!existsSync(goFile)) {
 const winner = new StateStore(dir).leaseWinner(watchId, Date.now());
 const winnerRunId = winner?.runId ?? "none";
 appendFileSync(resultFile, `${process.pid}|${runId}|${winnerRunId}\n`, "utf-8");
-// ⑤ 自认胜者保持存活至全部上报完（非胜者立即退出）
+// ⑤ done 屏障：自认胜者等待主进程写 done 文件后才退出（主进程在全部结果
+// 齐集后写 done）；非胜者上报后即退
 if (winnerRunId === runId) {
-  const collectDeadline = Date.now() + 60_000;
-  for (;;) {
-    if (Date.now() > collectDeadline) {
-      console.error("barrier: 等待全部上报超时");
+  const doneDeadline = Date.now() + 60_000;
+  while (!existsSync(doneFile)) {
+    if (Date.now() > doneDeadline) {
+      console.error("barrier: 等待 done 超时");
       process.exit(3);
     }
-    let n = 0;
-    try {
-      const text = readFileSync(resultFile, "utf-8").trim();
-      n = text === "" ? 0 : text.split("\n").length;
-    } catch {
-      // Windows 并发 append 的瞬态读锁（EBUSY/EPERM）：本拍读不到 → 下拍再读，异常不裸抛
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      continue;
-    }
-    if (n >= total) break;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }

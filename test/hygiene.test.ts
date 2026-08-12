@@ -118,7 +118,9 @@ describe("LLM 证据包脱敏", () => {
     const dir = join(tempHome(), "tmp");
     let evidencePath = "";
     const exec: ShellExec = async (_cmd, args) => {
-      evidencePath = args[args.length - 1]!;
+      // V2a：证据路径不裸传——从渲染 prompt 指令行提取
+      const m = args[args.length - 1]!.match(/证据文件（JSON，先读取再判断）：(.+)/);
+      evidencePath = m?.[1] ?? "";
       return { code: 0, stdout: JSON.stringify({ action: "silence" }), stderr: "" };
     };
     const consult = makeLlmConsult({ cmd: "node fake.mjs", exec, evidenceDir: dir, watchId: "w1" });
@@ -127,11 +129,13 @@ describe("LLM 证据包脱敏", () => {
         toolCallsSeen: 1,
         newToolCalls: 1,
         signals: [],
+        recentCommands: [],
         tailSummary: "Bearer supersecrettoken 与 AKIAIOSFODNN7EXAMPLE",
       },
       state: { settledBeats: 1, remindCount: 0, escalationCount: 0, llmCalls: 0, startedAt: 0, budgetMs: 1000, targetKind: "pi" },
       taskSummary: "正常任务摘要",
       recentEvents: [],
+      contract: null,
     });
     assert.strictEqual(result.note, "ok");
     const raw = readFileSync(evidencePath, "utf-8");

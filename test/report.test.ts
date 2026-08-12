@@ -94,4 +94,34 @@ describe("generateReport", () => {
     const report = generateReport(makeState({ eventsDegraded: true }), readOf([event("01", "watch_start")]));
     assert.ok(report.includes("事件落盘曾失败"));
   });
+
+  it("V2a 升级事件置顶展示：escalated（暂停/停止）在信号统计之前", () => {
+    const report = generateReport(makeState(), readOf([
+      event("01", "escalated", { to: "pause", trigger: "spin", pinned: true, reason: "WARNING 未获确认且信号复现，升级为暂停待命" }),
+      event("02", "decide", { action: "remind", reason: "机械提醒", signals: ["spin"] }),
+    ]));
+    assert.ok(report.includes("## 升级事件"), "升级事件节");
+    assert.ok(report.includes("暂停待命（触发：spin）"), "升级事件内容");
+    assert.ok(report.indexOf("## 升级事件") < report.indexOf("## 观察期间触发的信号"), "置顶于信号统计之前");
+  });
+
+  it("V2a 无升级事件 → 汇报不输出升级事件节（无冗余）", () => {
+    const report = generateReport(makeState(), readOf([event("01", "watch_start")]));
+    assert.ok(!report.includes("## 升级事件"));
+  });
+
+  it("V2a L4 停止升级事件展示为停止（客观硬边界）", () => {
+    const report = generateReport(makeState(), readOf([
+      event("01", "escalated", { to: "stop", pinned: true, reason: "L4 硬边界：删除工作区外路径（/tmp/x）" }),
+    ]));
+    assert.ok(report.includes("停止（客观硬边界）"), report);
+    assert.ok(report.includes("删除工作区外路径"), "升级事件含原因");
+  });
+
+  it("V2a 动作统计：warning 显示为警告（需要回应）", () => {
+    const report = generateReport(makeState(), readOf([
+      event("01", "decide", { action: "warning", reason: "信号反复未见改善", signals: ["spin"] }),
+    ]));
+    assert.ok(report.includes("警告（需要回应）：1 次"), report);
+  });
 });

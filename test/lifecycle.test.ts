@@ -145,6 +145,8 @@ class StubTarget implements TargetAdapter {
   readonly kind: "pi" | "codex" | "terminal";
   calls = 0;
   private readonly signals: Signal[];
+  /** V2a L4 传感替身 */
+  recentCommands: string[] = [];
 
   constructor(signals: Signal[] = [], kind: "pi" | "codex" | "terminal" = "pi") {
     this.signals = signals;
@@ -158,6 +160,7 @@ class StubTarget implements TargetAdapter {
         toolCallsSeen: this.calls,
         newToolCalls: 1,
         signals: this.signals,
+        recentCommands: [...this.recentCommands],
         tailSummary: "tail",
         taskSummary: "任务",
       },
@@ -206,6 +209,7 @@ function harness(opts: HarnessOptions = {}) {
     budgetMs: opts.budgetMs ?? 1_000_000,
     remindMax: 5,
     sessionFile: "f.jsonl",
+    workspaceRoot: "/workspace", // V2a：L4 硬边界判定用工作区根目录（测试固定）
     runPanel: null,
   };
   return { services, watchOpts, channel, target, events, dir, clock: () => clock };
@@ -268,7 +272,7 @@ describe("V1.1 运行代际与租约", () => {
     assert.strictEqual(loaded.leaseExpiresAt, h.clock() + LEASE_MS);
   });
 
-  it("已有 finished 状态 → 默认视为新任务：不继承 startedAt/remindCount/safetyWarningSent", async () => {
+  it("已有 finished 状态 → 默认视为新任务：不继承 startedAt/remindCount/warningSent", async () => {
     const h = harness({ budgetMs: 10_000 });
     await seed(h, {
       status: "finished",
@@ -276,7 +280,7 @@ describe("V1.1 运行代际与租约", () => {
       generation: 7,
       settledBeats: 99,
       remindCount: 9,
-      safetyWarningSent: true,
+      warningSent: true,
       startedAt: 5,
     });
     h.channel.reads = [{ text: "a", cursor: "10", alive: true }];
@@ -288,7 +292,7 @@ describe("V1.1 运行代际与租约", () => {
     const loaded = await loadOk(h.services.state, "w-life");
     assert.strictEqual(loaded.startedAt, 0, "startedAt 不继承旧运行");
     assert.strictEqual(loaded.remindCount, 0, "remindCount 不继承");
-    assert.strictEqual(loaded.safetyWarningSent, false, "safetyWarningSent 不继承");
+    assert.strictEqual(loaded.warningSent, false, "warningSent 不继承");
     assert.ok(loaded.settledBeats < 99, "节拍计数不继承");
     assert.strictEqual(loaded.generation, 8, "代际 +1");
     assert.notStrictEqual(loaded.watchRunId, "run-old");
@@ -362,7 +366,7 @@ describe("V1.1 运行代际与租约", () => {
         llmCalls: 0,
         startedAt: 100,
         budgetMs: 120_000,
-        safetyWarningSent: true,
+        warningSent: true,
         eventsDegraded: false,
         targetKind: "pi",
         channelKind: "file",
@@ -380,7 +384,7 @@ describe("V1.1 运行代际与租约", () => {
     const loaded = await loadOk(h.services.state, "w-life");
     assert.strictEqual(loaded.generation, 1);
     assert.strictEqual(loaded.remindCount, 0);
-    assert.strictEqual(loaded.safetyWarningSent, false);
+    assert.strictEqual(loaded.warningSent, false);
   });
 });
 
@@ -553,15 +557,13 @@ describe("V1.1 waitIdle 未知形状", () => {
 // ---------------------------------------------------------------------------
 
 describe("V1.1 停止验证", () => {
+  /** V2a：stop 仅剩 L4 客观硬边界触发——用删除工作区外路径的最近命令命中。 */
   function stopScenario(verifyResult: "verified" | "unverified"): ReturnType<typeof harness> {
-    const h = harness({ budgetMs: 10_000, target: new StubTarget(spinSignals()) });
+    const h = harness({ budgetMs: 1_000_000, target: new StubTarget(spinSignals()) });
     h.channel.kind = "orca";
     h.channel.verifyResult = verifyResult;
-    h.channel.waitResults = ["timeout", "timeout"];
-    h.channel.reads = [
-      { text: "a", cursor: "10", alive: true },
-      { text: "b", cursor: "20", alive: true },
-    ];
+    h.channel.reads = [{ text: "a", cursor: "10", alive: true }];
+    h.target.recentCommands = ["rm -rf /tmp/outside-data"];
     return h;
   }
 

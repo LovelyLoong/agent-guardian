@@ -26,6 +26,8 @@ import { withTransientRetry } from "../shared/fs.ts";
 
 const TAIL_SUMMARY_CHARS = 800;
 const TASK_SUMMARY_CHARS = 500;
+/** L4 传感：保留的最近命令条数（V2a） */
+const RECENT_COMMANDS_MAX = 3;
 
 interface CodexLine {
   type: string;
@@ -74,6 +76,8 @@ export class CodexAdapter implements TargetAdapter {
   private lastUserText = "";
   private contextTokens: number | null = null;
   private contextWindow: number | null = null;
+  /** 最近执行的 shell 命令文本（V2a L4 传感；按时间正序追加，最新在末尾） */
+  private recentCommands: string[] = [];
 
   constructor(file: string) {
     this.file = file;
@@ -89,6 +93,7 @@ export class CodexAdapter implements TargetAdapter {
           toolCallsSeen: -1,
           newToolCalls: 0,
           signals: [],
+          recentCommands: [],
           tailSummary: "(会话文件不可读)",
         },
         cursor: cursor ?? "",
@@ -111,6 +116,7 @@ export class CodexAdapter implements TargetAdapter {
       this.lastUserText = "";
       this.contextTokens = null;
       this.contextWindow = null;
+      this.recentCommands = [];
     }
     this.lastSize = size;
     let endOfLastCompleteLine = 0;
@@ -151,6 +157,7 @@ export class CodexAdapter implements TargetAdapter {
         toolCallsSeen: this.facts.length,
         newToolCalls,
         signals,
+        recentCommands: [...this.recentCommands],
         tailSummary: this.lastMessageText !== "" ? truncate(this.lastMessageText, TAIL_SUMMARY_CHARS) : "(无消息文本)",
         taskSummary: this.lastUserText !== "" ? truncate(this.lastUserText, TASK_SUMMARY_CHARS) : "",
       },
@@ -165,6 +172,7 @@ export class CodexAdapter implements TargetAdapter {
       const kind = payload["type"];
       if (kind === "function_call") {
         this.addCall(String(payload["name"] ?? ""), parseArgs(payload["arguments"]), String(payload["call_id"] ?? ""));
+        this.collectCommand(String(payload["name"] ?? ""), parseArgs(payload["arguments"]));
         return;
       }
       if (kind === "custom_tool_call") {
@@ -172,6 +180,7 @@ export class CodexAdapter implements TargetAdapter {
         const name = String(payload["name"] ?? "");
         const input = payload["input"];
         const args = typeof input === "string" ? { input } : { input: String(input ?? "") };
+        this.collectCommand(name, args);
         const idx = this.addCall(name, args, String(payload["call_id"] ?? ""));
         // custom_tool_call 自带状态；显式失败状态直接判错
         if (typeof status === "string" && (status === "error" || status === "failed")) {
@@ -204,6 +213,17 @@ export class CodexAdapter implements TargetAdapter {
       if (info !== undefined && typeof info["model_context_window"] === "number") {
         this.contextWindow = info["model_context_window"];
       }
+    }
+  }
+
+  /** L4 传感：收集 shell 类工具的命令文本（V2a）。 */
+  private collectCommand(name: string, args: Record<string, unknown>): void {
+    if (name !== "exec" && name !== "shell" && name !== "bash") return;
+    const raw = args["cmd"] ?? args["command"] ?? args["input"];
+    if (typeof raw !== "string" || raw.trim() === "") return;
+    this.recentCommands.push(raw);
+    if (this.recentCommands.length > RECENT_COMMANDS_MAX) {
+      this.recentCommands.shift();
     }
   }
 

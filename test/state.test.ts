@@ -47,22 +47,27 @@ describe("StateStore", () => {
     s.settledBeats = 7;
     s.remindCount = 2;
     s.escalationCount = 1;
+    s.settledIncidents = ["incident-key-1"];
     s.cooldownUntil = { spin: 9 };
     s.remindHistory = [{ kind: "spin", beat: 3, factsHash: "abc" }];
     s.llmCalls = 1;
-    s.safetyWarningTrigger = "budget";
+    s.warningTrigger = "spin";
     await store.save("w1", s);
 
     const loaded = await okState(store, "w1");
     assert.strictEqual(loaded.settledBeats, 7);
     assert.strictEqual(loaded.remindCount, 2);
     assert.strictEqual(loaded.escalationCount, 1);
+    assert.deepStrictEqual(loaded.settledIncidents, ["incident-key-1"]);
     assert.strictEqual(loaded.llmCalls, 1);
     assert.strictEqual(loaded.startedAt, 1_000);
     assert.deepStrictEqual(loaded.cooldownUntil, { spin: 9 });
     assert.deepStrictEqual(loaded.remindHistory, [{ kind: "spin", beat: 3, factsHash: "abc" }]);
-    assert.strictEqual(loaded.safetyWarningSent, false);
-    assert.strictEqual(loaded.safetyWarningTrigger, "budget");
+    assert.strictEqual(loaded.warningSent, false);
+    assert.strictEqual(loaded.warningTrigger, "spin");
+    assert.strictEqual(loaded.paused, false);
+    assert.strictEqual(loaded.pauseTrigger, null);
+    assert.strictEqual(loaded.contract, null);
     assert.strictEqual(loaded.channelKind, "file");
     assert.strictEqual(loaded.targetKind, "pi");
   });
@@ -100,8 +105,8 @@ describe("StateStore", () => {
     assert.strictEqual(loaded.settledBeats, 3);
     assert.strictEqual(loaded.remindCount, 0);
     assert.deepStrictEqual(loaded.cooldownUntil, {});
-    assert.strictEqual(loaded.safetyWarningSent, false);
-    assert.strictEqual(loaded.safetyWarningTrigger, null);
+    assert.strictEqual(loaded.warningSent, false);
+    assert.strictEqual(loaded.warningTrigger, null);
     assert.strictEqual(loaded.budgetMs, 0);
   });
 
@@ -656,13 +661,14 @@ describe("V1.2 barrier 跨进程选举探针（ready/go 同步）", () => {
     const readyDir = join(dir, "ready");
     const goFile = join(dir, "go");
     const resultFile = join(dir, "results.txt");
+    const doneFile = join(dir, "done");
     mkdirSync(readyDir, { recursive: true });
     // 全部子进程：先 append claim → 写各自 ready 文件 → 等 go → 同时求值 → 上报
     const errByChild = new Map<ChildProcess, string>();
     const children = Array.from({ length: count }, () => {
       const child = spawn(
         process.execPath,
-        [barrierProbe, dir, watchId, readyDir, goFile, resultFile, String(count)],
+        [barrierProbe, dir, watchId, readyDir, goFile, resultFile, doneFile],
         { stdio: ["ignore", "ignore", "pipe"] },
       );
       errByChild.set(child, "");
@@ -679,9 +685,10 @@ describe("V1.2 barrier 跨进程选举探针（ready/go 同步）", () => {
     }
     writeFileSync(goFile, "go", "utf-8");
     // 选举窗口内轮询：任一时刻恰 1 存活胜者，且胜者恒定。窗口 = 求值进行中
-    // （结果行数 < count：尚未全部上报）；齐集后选举已结束，胜者可能随即退出
-    // （其 claim 随进程死亡自然失效），不再轮询——齐集前的每个瞬间胜者进程都
-    // 按探针契约保持存活，故窗口内永不出现无胜者。
+    // （结果行数 < count：尚未全部上报）。窗口内胜者进程按 done 屏障契约保持
+    // 存活（主进程在结果齐集后才写 done，胜者收后才退）——窗口内永不出现无
+    // 胜者或胜者翻转（m1：旧实现胜者自读并发追加中的 resultFile 行数决定何时
+    // 退出，Windows 并发读不稳/收齐超时退出 → 合法继位被误判为胜者翻转）。
     const store = new StateStore(dir);
     const observed = new Set<string>();
     const pollDeadline = Date.now() + 120_000;
@@ -701,7 +708,9 @@ describe("V1.2 barrier 跨进程选举探针（ready/go 同步）", () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.strictEqual(observed.size, 1, `选举窗口内胜者必须恒定恰 1 个（实测 ${[...observed].join(",")}）`);
-    // 等待全部子进程退出（齐集后胜者才会退出）
+    // 结果齐集 → 主进程写 done（done 屏障）：胜者收到后才退出；非胜者早已上报即退
+    writeFileSync(doneFile, "done", "utf-8");
+    // 等待全部子进程退出（done 后胜者才退出）
     await Promise.all(
       children.map((c) =>
         c.exitCode !== null ? Promise.resolve() : new Promise<void>((resolve) => c.once("exit", () => resolve())),

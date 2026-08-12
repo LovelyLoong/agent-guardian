@@ -18,6 +18,8 @@ export interface BeatFacts {
   newToolCalls: number;
   /** 复用信号引擎的输出 */
   signals: Signal[];
+  /** 最近执行的 shell 命令文本（V2a L4 客观硬边界传感；最多最近 N 条，无证据源时空数组） */
+  recentCommands: string[];
   /** 给 LLM 证据包用的尾部摘要（截断） */
   tailSummary: string;
   /** 会话文件存在时提供的任务摘要（最后一条用户消息，截断）；无文件时缺省 */

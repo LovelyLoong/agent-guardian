@@ -2,8 +2,8 @@
 /**
  * agent-guardian — CLI 入口。
  *
- *   guardian watch --terminal <handle> [--session <file>] [--llm "<cmd>"] [--budget-min 120] [--remind-max 5] [--llm-max-calls 3] [--retention-days 14]
- *   guardian watch --file <session.jsonl>
+ *   guardian watch --terminal <handle> [--session <file>] [--contract <path>] [--llm "<cmd>"] [--budget-min 120] [--remind-max 5] [--llm-max-calls 3] [--retention-days 14]
+ *   guardian watch --file <session.jsonl> [--contract <path>]
  *   guardian panel "<问题>" [--n 3] [--backend orca|headless] [--out <dir>] [--materials <p>...]
  *                        [--agent <name>] [--member-cmd "<cmd>"] [--synthesize-cmd "<cmd>"] [--no-synthesize]
  *   guardian events [--watch <id>] [--retention-days 14]
@@ -31,6 +31,8 @@ import { TerminalAdapter } from "../src/targets/terminal.ts";
 import { detectTargetKind } from "../src/targets/types.ts";
 import type { TargetAdapter } from "../src/targets/types.ts";
 import { StateStore } from "../src/watcher/state.ts";
+import { parseContractFile } from "../src/watcher/contract.ts";
+import type { TaskContract } from "../src/watcher/contract.ts";
 import { makeLlmConsult } from "../src/watcher/llm.ts";
 import type { ShellExec } from "../src/watcher/llm.ts";
 import { runWatch, PANEL_MEMBER_TIMEOUT_MS } from "../src/watcher/loop.ts";
@@ -49,6 +51,7 @@ export interface WatchCliOptions {
   file: string | null;
   session: string | null;
   llm: string | null;
+  contract: string | null;
   budgetMin: number;
   remindMax: number;
   llmMaxCalls: number;
@@ -61,6 +64,7 @@ export function parseWatchArgs(argv: string[]): WatchCliOptions | string {
     file: null,
     session: null,
     llm: null,
+    contract: null,
     budgetMin: 120,
     remindMax: 5,
     llmMaxCalls: 3,
@@ -74,6 +78,7 @@ export function parseWatchArgs(argv: string[]): WatchCliOptions | string {
       case "--file":
       case "--session":
       case "--llm":
+      case "--contract":
       case "--budget-min":
       case "--remind-max":
       case "--llm-max-calls":
@@ -84,6 +89,7 @@ export function parseWatchArgs(argv: string[]): WatchCliOptions | string {
         else if (arg === "--file") opts.file = value;
         else if (arg === "--session") opts.session = value;
         else if (arg === "--llm") opts.llm = value;
+        else if (arg === "--contract") opts.contract = value;
         else if (arg === "--budget-min") {
           const n = Number(value);
           if (!Number.isInteger(n) || n < 1) return "--budget-min 必须是正整数（分钟）";
@@ -342,6 +348,17 @@ async function cmdWatch(argv: string[]): Promise<number> {
   const home = resolveHome();
   const dirs = dirsFor(home);
   const orca = new OrcaCli();
+  // V2a：任务契约（--contract）启动时校验存在性与形状；非法 → 退出码 2，不进监督循环。
+  let contract: TaskContract | null = null;
+  if (parsed.contract !== null) {
+    const parsedContract = parseContractFile(parsed.contract);
+    if (parsedContract.kind === "error") {
+      console.error(`guardian watch: 契约错误: ${parsedContract.reason}`);
+      return 2;
+    }
+    contract = parsedContract.contract;
+    console.log(`guardian: 已挂载任务契约 ${parsed.contract}`);
+  }
   // V1.1 证据卫生：启动前清理超保留期（默认 14 天）的旧 watch 产物。
   const removed = cleanupOldWatches(dirs, parsed.retentionDays);
   if (removed.length > 0) {
@@ -394,6 +411,8 @@ async function cmdWatch(argv: string[]): Promise<number> {
     remindMax: parsed.remindMax,
     llmMaxCalls: parsed.llmMaxCalls, // M1：LLM 回调全局上限（默认 3）
     sessionFile,
+    contract, // V2a：任务契约（不可变；进证据包与汇报头部）
+    workspaceRoot: process.cwd(), // V2a：L4 硬边界判定的工作区根目录（监督进程启动目录）
     runPanel: runPanelExecutor,
   };
   const services: WatchServices = {
@@ -479,7 +498,10 @@ async function cmdEvents(argv: string[]): Promise<number> {
       console.log(`（无 ${parsed.watch} 的事件记录）`);
       return 0;
     }
-    for (const ev of read.events) {
+    // V2a：升级事件（pinned:true）置顶输出（事件流置顶，design §9.2）
+    const pinned = read.events.filter((ev) => ev["pinned"] === true);
+    const rest = read.events.filter((ev) => ev["pinned"] !== true);
+    for (const ev of [...pinned, ...rest]) {
       console.log(JSON.stringify(ev));
     }
     return 0;
@@ -536,12 +558,17 @@ function usage(): void {
   console.log(`guardian — 跨 CLI 运行期监督与讨论组编排
 
 用法：
-  guardian watch --terminal <handle> [--session <file>] [--llm "<cmd>"] [--budget-min 120] [--remind-max 5] [--llm-max-calls 3] [--retention-days 14]
-  guardian watch --file <会话文件>
+  guardian watch --terminal <handle> [--session <file>] [--contract <path>] [--llm "<cmd>"] [--budget-min 120] [--remind-max 5] [--llm-max-calls 3] [--retention-days 14]
+  guardian watch --file <会话文件> [--contract <path>]
   guardian panel "<问题>" [--n 3] [--backend orca|headless] [--out <dir>] [--materials <p>...]
                   [--agent <name>] [--member-cmd "<cmd>"] [--synthesize-cmd "<cmd>"] [--no-synthesize]
   guardian events [--watch <id>] [--retention-days 14]
   guardian report --watch <id>
+
+--contract <path>：任务契约 JSON {requirement, acceptance[], scope[], approvedDecisions[]}，
+  启动时校验存在性与形状（非法 → 退出码 2）；契约内容进每次外部判断证据包与完工汇报头部。
+--llm "<cmd>"：外部判断命令（默认建议 pi -p）；watcher 写证据文件并以固定判断者
+  提示词（含证据路径与输出 JSON schema）作为最后一个参数调用，读取 stdout 的 JSON 决定。
 
 数据目录：~/.agent-guardian/（可用 AGENT_GUARDIAN_HOME 覆盖）。
 详细说明见 README.md 与 docs/design.md。`);

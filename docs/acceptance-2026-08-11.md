@@ -56,3 +56,12 @@
 - 实现：deepseek/deepseek-v4-flash:max（公司通道额度耗尽后切个人通道）；验收：openai-codex/gpt-5.6-luna:max 多轮（锁协议经 5+ 轮跨进程探针收敛：claim 非原子→回收 TOCTOU→settle 窗口→EBUSY 胜者崩溃假象→写路径无重试→fencing 顺序→finish TOCTOU 缓解→load 中止）。
 - 终审证据：275/275 ×2 全绿（governor 95/95）；跨进程 barrier（30-50 子进程）恰 1 胜者零崩溃多轮；W5 调度者亲测探针（load error → exit 4 + 零共享写入）。
 - 已知残余（裁决接受）：finish 校验→rename 微秒级窗口无 OS 级可移植原子锁可消除，后果自愈（注释声明）；E-SafeNet 透明加密环境下非白名单进程读到密文——子代理验收的读文件类探针在此环境不可靠，读代码类终审证据以调度者主会话为准。
+
+---
+
+## V2a 增补验收：干预语义重排 + 任务契约 + guardian-judge profile（v0.3.0）
+
+- 日期：2026-08-12
+- 内容（design.md §9.2/§9.3-1/2）：①机械信号路径重排为 L1 Advise → L2 WARNING（须 ACK）→ pause（可逆），删除一切"计数→stop"自动路径；②预算到期只退出不动目标；③stop 仅剩 L4 客观硬边界模式表（工作区外删除/凭据外泄）；④--contract 任务契约（形状校验 exit 2，进证据包与汇报头）；⑤guardian-judge 固定 profile（只读角色/证据不可信/强制 schema/禁改代码）；⑥升级阶梯 per-incident（signalKey=kind:factsHash，封顶后只记录；废除全局计数器触发）。
+- 实现：deepseek/deepseek-v4-flash:max（个人通道）；验收：openai-codex/gpt-5.6-luna:max 多轮（全局计数器、key 碰撞、封顶不一致等语义缺陷均修复）；终审轮 reviewer 环境异常中断，末轮由调度者亲自复核（signalKey/pauseTrigger 代码直读 + decide/state 测试 47/47、36/36 + 全套 329×3 零 flake）。
+- 未执行项：V2b（incident FSM、分级 mailbox+ACK、结构化事件传感、完工 fresh reviewer、panel 异步降级）见 design.md §9.3-3/4/5/6/7。

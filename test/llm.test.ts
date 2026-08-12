@@ -73,7 +73,7 @@ describe("parseDecisionOutput", () => {
 });
 
 describe("makeLlmConsult", () => {
-  it("写入证据文件、追加路径参数调用命令、解析其 stdout", async () => {
+  it("写入证据文件、以 judge 模板渲染的 prompt 作为参数调用命令、解析其 stdout", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ag-llm-"));
     const calls: string[] = [];
     const fakeExec: ShellExec = async (cmd, args) => {
@@ -82,23 +82,28 @@ describe("makeLlmConsult", () => {
     };
     const consult = makeLlmConsult({ cmd: "node fake-decider.mjs", exec: fakeExec, evidenceDir: dir, watchId: "w1" });
     const evidence = {
-      facts: { toolCallsSeen: 3, newToolCalls: 1, signals: [], tailSummary: "t" },
+      facts: { toolCallsSeen: 3, newToolCalls: 1, signals: [], recentCommands: [], tailSummary: "t" },
       state: { settledBeats: 5, remindCount: 1, escalationCount: 2, llmCalls: 1, startedAt: 0, budgetMs: 1, targetKind: "pi" },
       taskSummary: "任务",
       recentEvents: [{ type: "x" }],
+      contract: null,
     };
     const result = await consult(evidence);
     assert.strictEqual(result.note, "ok");
     assert.strictEqual(result.decision.action, "pause");
     assert.strictEqual(calls.length, 1);
     assert.ok(calls[0]!.includes("node fake-decider.mjs"));
+    // V2a：最后一个参数是渲染后的判断者 prompt（含证据路径指令与输出 schema），不是裸路径
+    assert.ok(calls[0]!.includes("guardian-judge"), "应传 judge 模板 prompt");
+    assert.ok(calls[0]!.includes(".json"), "prompt 内含证据文件路径指令");
     const files = readdirSync(dir);
     assert.strictEqual(files.length, 1);
     const written = JSON.parse(readFileSync(join(dir, files[0]!), "utf-8"));
     assert.strictEqual(written.taskSummary, "任务");
+    assert.strictEqual(written.contract, null);
   });
 
-  it("回调命令以参数数组调用：cmd/args 分离，证据路径为最后一个字面参数（M3）", async () => {
+  it("回调命令以参数数组调用：cmd/args 分离，最后一个字面参数为渲染后的 judge prompt（M3）", async () => {
     const dir = mkdtempSync(join(tmpdir(), "ag-llm-"));
     const calls: Array<{ cmd: string; args: string[] }> = [];
     const fakeExec: ShellExec = async (cmd, args) => {
@@ -107,27 +112,34 @@ describe("makeLlmConsult", () => {
     };
     const consult = makeLlmConsult({ cmd: "node fake-decider.mjs", exec: fakeExec, evidenceDir: dir, watchId: "w1" });
     const r = await consult({
-      facts: { toolCallsSeen: 0, newToolCalls: 0, signals: [], tailSummary: "" },
+      facts: { toolCallsSeen: 0, newToolCalls: 0, signals: [], recentCommands: [], tailSummary: "" },
       state: { settledBeats: 0, remindCount: 0, escalationCount: 0, llmCalls: 0, startedAt: 0, budgetMs: 1, targetKind: "pi" },
       taskSummary: "",
       recentEvents: [],
+      contract: null,
     });
     assert.strictEqual(r.note, "ok");
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(calls[0]!.cmd, "node", "cmd 不得含 shell 拼接");
     assert.deepStrictEqual(calls[0]!.args.slice(0, 1), ["fake-decider.mjs"]);
-    assert.ok(calls[0]!.args[1]!.endsWith(".json"), "证据路径作为最后一个字面参数");
-    assert.ok(!calls[0]!.args[1]!.includes('"'), "参数不再被引号包裹拼接");
+    // V2a：最后参数是 prompt 文本（非裸证据路径）；prompt 内含证据文件路径
+    const prompt = calls[0]!.args[1]!;
+    assert.ok(prompt.includes("guardian-judge"), "prompt 含判断者角色");
+    assert.ok(prompt.includes(".json"), "prompt 内含证据文件路径");
+    assert.strictEqual(calls[0]!.args.length, 2, "prompt 为单个字面参数（不拆散、不经 shell）");
+    const evidencePath = prompt.match(/证据文件（JSON，先读取再判断）：(.+)/)?.[1];
+    assert.ok(evidencePath !== undefined && evidencePath.endsWith(".json"), "prompt 含证据路径指令");
   });
 
   it("命令执行失败 → 非法 → silence", async () => {
     const fakeExec: ShellExec = async () => ({ code: 1, stdout: "", stderr: "boom" });
     const consult = makeLlmConsult({ cmd: "nope", exec: fakeExec, evidenceDir: mkdtempSync(join(tmpdir(), "ag-llm-")), watchId: "w1" });
     const r = await consult({
-      facts: { toolCallsSeen: 0, newToolCalls: 0, signals: [], tailSummary: "" },
+      facts: { toolCallsSeen: 0, newToolCalls: 0, signals: [], recentCommands: [], tailSummary: "" },
       state: { settledBeats: 0, remindCount: 0, escalationCount: 0, llmCalls: 0, startedAt: 0, budgetMs: 1, targetKind: "pi" },
       taskSummary: "",
       recentEvents: [],
+      contract: null,
     });
     assert.strictEqual(r.note, "invalid");
   });
@@ -140,10 +152,11 @@ describe("makeLlmConsult", () => {
     });
     const consult = makeLlmConsult({ cmd: "crashed-decider", exec: fakeExec, evidenceDir: mkdtempSync(join(tmpdir(), "ag-llm-")), watchId: "w1" });
     const r = await consult({
-      facts: { toolCallsSeen: 0, newToolCalls: 0, signals: [], tailSummary: "" },
+      facts: { toolCallsSeen: 0, newToolCalls: 0, signals: [], recentCommands: [], tailSummary: "" },
       state: { settledBeats: 0, remindCount: 0, escalationCount: 0, llmCalls: 0, startedAt: 0, budgetMs: 1, targetKind: "pi" },
       taskSummary: "",
       recentEvents: [],
+      contract: null,
     });
     assert.strictEqual(r.note, "invalid");
     assert.strictEqual(r.decision.action, "silence");
@@ -162,10 +175,11 @@ describe("makeLlmConsult", () => {
     };
     const consult = makeLlmConsult({ cmd: "node x.mjs", exec: fakeExec, evidenceDir: blocker, watchId: "w1" });
     const r = await consult({
-      facts: { toolCallsSeen: 0, newToolCalls: 0, signals: [], tailSummary: "" },
+      facts: { toolCallsSeen: 0, newToolCalls: 0, signals: [], recentCommands: [], tailSummary: "" },
       state: { settledBeats: 0, remindCount: 0, escalationCount: 0, llmCalls: 0, startedAt: 0, budgetMs: 1, targetKind: "pi" },
       taskSummary: "",
       recentEvents: [],
+      contract: null,
     });
     assert.strictEqual(r.note, "invalid");
     assert.strictEqual(r.decision.action, "silence");
@@ -216,10 +230,11 @@ describe("B3 契约上限与净化", () => {
   it("stdout 超 64KB → invalid → silence（契约上限）", async () => {
     const fakeExec: ShellExec = async () => ({ code: 0, stdout: "x".repeat(64 * 1024 + 1), stderr: "" });    const consult = makeLlmConsult({ cmd: "node x.mjs", exec: fakeExec, evidenceDir: mkdtempSync(join(tmpdir(), "ag-llm-")), watchId: "w1" });
     const r = await consult({
-      facts: { toolCallsSeen: 0, newToolCalls: 0, signals: [], tailSummary: "" },
+      facts: { toolCallsSeen: 0, newToolCalls: 0, signals: [], recentCommands: [], tailSummary: "" },
       state: { settledBeats: 0, remindCount: 0, escalationCount: 0, llmCalls: 0, startedAt: 0, budgetMs: 1, targetKind: "pi" },
       taskSummary: "",
       recentEvents: [],
+      contract: null,
     });
     assert.strictEqual(r.note, "invalid");
     assert.strictEqual(r.decision.action, "silence");
@@ -245,10 +260,11 @@ describe("B3 契约上限与净化", () => {
     const fakeExec: ShellExec = async () => ({ code: 0, stdout: big, stderr: "" });
     const consult = makeLlmConsult({ cmd: "node x.mjs", exec: fakeExec, evidenceDir: mkdtempSync(join(tmpdir(), "ag-llm-")), watchId: "w1" });
     const r = await consult({
-      facts: { toolCallsSeen: 0, newToolCalls: 0, signals: [], tailSummary: "" },
+      facts: { toolCallsSeen: 0, newToolCalls: 0, signals: [], recentCommands: [], tailSummary: "" },
       state: { settledBeats: 0, remindCount: 0, escalationCount: 0, llmCalls: 0, startedAt: 0, budgetMs: 1, targetKind: "pi" },
       taskSummary: "",
       recentEvents: [],
+      contract: null,
     });
     assert.strictEqual(r.note, "invalid");
     assert.strictEqual(r.decision.action, "silence");
@@ -262,10 +278,11 @@ describe("B3 契约上限与净化", () => {
     const fakeExec: ShellExec = async () => ({ code: 0, stdout: big, stderr: "" });
     const consult = makeLlmConsult({ cmd: "node x.mjs", exec: fakeExec, evidenceDir: mkdtempSync(join(tmpdir(), "ag-llm-")), watchId: "w1" });
     const r = await consult({
-      facts: { toolCallsSeen: 0, newToolCalls: 0, signals: [], tailSummary: "" },
+      facts: { toolCallsSeen: 0, newToolCalls: 0, signals: [], recentCommands: [], tailSummary: "" },
       state: { settledBeats: 0, remindCount: 0, escalationCount: 0, llmCalls: 0, startedAt: 0, budgetMs: 1, targetKind: "pi" },
       taskSummary: "",
       recentEvents: [],
+      contract: null,
     });
     assert.strictEqual(r.note, "invalid");
     assert.strictEqual(r.decision.action, "silence");

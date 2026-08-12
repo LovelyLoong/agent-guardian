@@ -4,6 +4,9 @@
  * 措辞纪律：用户可见文本只有目标、做法、时间、代价；
  * 禁用词（L0/L1/相位/hash/stale/basis/snapshot/dedupe）不出现在报告中。
  *
+ * V2a：任务契约（--contract 挂载）进汇报头部；升级事件（escalated，pinned:true）
+ * 置顶展示（design §9.2：报告/事件流置顶）。
+ *
  * 统计口径（与 watcher 实际 produce 的事件对齐）：
  * - 信号统计来自 decide 事件自带的 signals 字段（有信号的拍必然落 decide 事件）；
  * - 收尾方式来自 finish 事件（watcher 先追加 finish 再生成报告）；
@@ -41,6 +44,45 @@ export function generateReport(
   lines.push(`- 起止：${new Date(state.startedAt).toISOString()} 起，持续约 ${durationMin} 分钟`);
   lines.push(`- 节拍数：${state.settledBeats}`);
   lines.push("");
+
+  // 任务契约（V2a）：--contract 挂载时进汇报头部
+  if (state.contract !== null) {
+    lines.push("## 任务契约");
+    lines.push("");
+    lines.push(`- 需求：${inlineReason(state.contract.requirement, 400)}`);
+    if (state.contract.acceptance.length > 0) {
+      lines.push("- 验收标准：");
+      for (const a of state.contract.acceptance) {
+        lines.push(`  - ${inlineReason(a, 400)}`);
+      }
+    }
+    if (state.contract.scope.length > 0) {
+      lines.push(`- 范围：${state.contract.scope.map((s) => inlineReason(s, 200)).join("；")}`);
+    }
+    if (state.contract.approvedDecisions.length > 0) {
+      lines.push(`- 已批准决策：${state.contract.approvedDecisions.map((s) => inlineReason(s, 200)).join("；")}`);
+    }
+    lines.push("");
+  }
+
+  // 升级事件（V2a，置顶）：escalated 事件（L2→暂停 / L4→停止）优先展示；
+  // 无升级事件时不输出该节（无冗余；不干扰"（无）"的既有语义）
+  const escalated = events.filter((ev) => ev.type === "escalated");
+  if (escalated.length > 0 || read.degraded) {
+    lines.push("## 升级事件");
+    lines.push("");
+    if (read.degraded) {
+      lines.push("（事件记录读取降级，以下可能不完整）");
+    } else {
+      for (const ev of escalated) {
+        const to = String(ev["to"] ?? "");
+        const label = to === "stop" ? "停止（客观硬边界）" : to === "pause" ? "暂停待命" : String(to);
+        const trigger = ev["trigger"] !== undefined ? `（触发：${String(ev["trigger"])}）` : "";
+        lines.push(`- ${String(ev["ts"]).slice(11, 19)} ${label}${trigger} — ${inlineReason(ev["reason"])}`);
+      }
+    }
+    lines.push("");
+  }
 
   // 信号统计（口径：decide 事件的 signals 字段 = 该拍实际检测到的信号种类）
   const signalCounts = new Map<string, number>();
@@ -134,12 +176,12 @@ function actionLabel(action: string): string {
   switch (action) {
     case "remind":
       return "提醒";
+    case "warning":
+      return "警告（需要回应）";
     case "pause":
       return "暂停";
     case "panel":
       return "发起讨论组";
-    case "safety-warning":
-      return "最后警告";
     case "stop":
       return "停止";
     case "silence":

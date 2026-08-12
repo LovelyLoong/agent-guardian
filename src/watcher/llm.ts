@@ -1,8 +1,9 @@
 /**
- * agent-guardian — LLM 回调契约。
+ * agent-guardian — LLM 回调契约（V2a：guardian-judge profile 化）。
  *
- * 默认关闭（纯机械模式）。--llm "<cmd>" 提供时启用：
- * watcher 把 evidence.json 路径作为最后一个参数传给命令，
+ * 默认关闭（纯机械模式）。--llm "<cmd>" 提供时启用（默认命令建议 `pi -p`）：
+ * watcher 写 evidence.json（redact 后），再以 judge.ts 模板渲染后的文本
+ * （含证据文件路径指令与输出 schema）作为最后一个参数调用命令，
  * 读其 stdout 的 decision JSON。
  *
  * schema 校验（watcher 权威）：action ∈ {silence, remind, pause, panel}；
@@ -16,6 +17,8 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { redactText } from "./redact.ts";
+import { renderJudgePrompt } from "./judge.ts";
+import type { TaskContract } from "./contract.ts";
 import type { BeatFacts } from "../targets/types.ts";
 import type { WatchState } from "./state.ts";
 import type { DecisionAction } from "./decide.ts";
@@ -26,6 +29,8 @@ export interface EvidencePack {
   state: PublicState;
   taskSummary: string;
   recentEvents: unknown[];
+  /** 任务契约（--contract 挂载；无契约时 null；V2a 每次证据包均携带） */
+  contract: TaskContract | null;
 }
 
 /** 给 LLM 的状态子集（不含内部游标细节） */
@@ -162,7 +167,8 @@ function reasonOf(obj: Record<string, unknown>, fallback: string): string {
   return typeof v === "string" && v.trim() !== "" ? v : fallback;
 }
 
-/** 执行 LLM 回调命令（参数数组形式，无 shell），写入证据文件后追加路径参数调用。 */
+/** 执行 LLM 回调命令（参数数组形式，无 shell）：写证据文件后，以 judge.ts
+ *  模板渲染后的 prompt（含证据路径指令与输出 schema）作为最后一个参数调用。 */
 export function makeLlmConsult(opts: {
   cmd: string;
   exec: ShellExec;
@@ -177,7 +183,7 @@ export function makeLlmConsult(opts: {
     try {
       mkdirSync(opts.evidenceDir, { recursive: true });
       path = join(opts.evidenceDir, `${opts.watchId}-${Date.now()}.json`);
-      // V1.1 证据卫生：证据包可能含用户文本（尾部摘要/事件/任务摘要），
+      // V1.1 证据卫生：证据包可能含用户文本（尾部摘要/事件/任务摘要/契约），
       // 写入前执行秘密模式过滤（命中替换为 [REDACTED]）。
       const redacted = redactText(JSON.stringify(evidence, null, 2) + "\n");
       writeFileSync(path, redacted.text, "utf-8");
@@ -185,9 +191,12 @@ export function makeLlmConsult(opts: {
       return invalid(`证据包写入失败: ${String(err)}`);
     }
     const { cmd, args } = splitCommand(opts.cmd);
+    // V2a（guardian-judge profile）：不再裸传证据路径——以 judge 模板渲染后的
+    // 文本作为最后一个参数（模板内含读取证据文件的指令与输出 JSON schema）。
+    const prompt = renderJudgePrompt(path, evidence.contract);
     let res;
     try {
-      res = await opts.exec(cmd, [...args, path], timeoutMs);
+      res = await opts.exec(cmd, [...args, prompt], timeoutMs);
     } catch (err) {
       return invalid(`回调命令执行失败: ${String(err)}`);
     }
@@ -205,7 +214,7 @@ export function makeLlmConsult(opts: {
   };
 }
 
-/** 构造证据包。 */
+/** 构造证据包（含任务契约，V2a）。 */
 export function buildEvidencePack(
   facts: BeatFacts,
   state: WatchState,
@@ -224,5 +233,6 @@ export function buildEvidencePack(
     },
     taskSummary: facts.taskSummary ?? "",
     recentEvents,
+    contract: state.contract ?? null,
   };
 }

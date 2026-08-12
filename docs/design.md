@@ -100,6 +100,9 @@ orca terminal split --terminal $ORCA_TERMINAL_HANDLE --direction vertical \
 3. 游标前进 → `resolveFacts()` 取证。
 
 ### 机械决策树（decide.ts，纯函数可单测）
+
+> **V2a 起本节被 §9.2 取代**：干预语义以 §9.2 重排表为最终口径（信号→L1/L2/pause 按 incident 阶梯、预算到期只退出、stop 仅限 L4 客观硬边界）。下表为 V1 历史行为存档，仅供理解演进：
+
 1. 无信号 → 沉默。
 2. 有信号且非冷却/非重复 → **机械提醒**（steer 模板含具体证据：信号 kind+关键 facts），计数+冷却 3 拍。轻提醒上限 5 次。
 3. 同一信号提醒后复现（升级计数 ≥2）→ **LLM 回调点**（若配置）：发证据包，执行返回的合法决定（remind/pause/panel）；未配置 → 进入安全网判定。
