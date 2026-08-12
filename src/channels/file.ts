@@ -17,6 +17,7 @@ import type { FSWatcher } from "node:fs";
 import { basename, dirname } from "node:path";
 import type { Channel, ReadResult } from "./types.ts";
 import { UnsupportedError } from "./types.ts";
+import { withTransientRetry } from "../shared/fs.ts";
 
 /** 无变更静默窗口：超过该时长无变更 → 判空闲 */
 export const FILE_QUIESCENT_MS = 10_000;
@@ -142,7 +143,8 @@ export class FileChannel implements Channel {
     }
     let text = "";
     if (size > this.cursorBytes) {
-      const buf = readFileSync(handle);
+      // EBUSY/EPERM（目标进程并发追加写锁）→ 瞬态重试；重试耗尽才抛（调用方按不可达处理）
+      const buf = await withTransientRetry(() => readFileSync(handle));
       text = buf.subarray(this.cursorBytes, size).toString("utf-8");
       this.cursorBytes = size;
     }
@@ -155,6 +157,11 @@ export class FileChannel implements Channel {
 
   async stop(_handle: string): Promise<void> {
     throw new UnsupportedError("stop");
+  }
+
+  /** 纯观察模式无停止能力：验证随 stop 一起不支持（正常流程不会被调用）。 */
+  async verifyStopped(_handle: string, _opts?: import("./types.ts").StopVerifyOptions): Promise<"verified" | "unverified"> {
+    throw new UnsupportedError("stop 验证");
   }
 }
 

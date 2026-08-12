@@ -2,14 +2,14 @@
 /**
  * agent-guardian — CLI 入口。
  *
- *   guardian watch --terminal <handle> [--session <file>] [--llm "<cmd>"] [--budget-min 120] [--remind-max 5] [--llm-max-calls 3]
+ *   guardian watch --terminal <handle> [--session <file>] [--llm "<cmd>"] [--budget-min 120] [--remind-max 5] [--llm-max-calls 3] [--retention-days 14]
  *   guardian watch --file <session.jsonl>
  *   guardian panel "<问题>" [--n 3] [--backend orca|headless] [--out <dir>] [--materials <p>...]
  *                        [--agent <name>] [--member-cmd "<cmd>"] [--synthesize-cmd "<cmd>"] [--no-synthesize]
- *   guardian events [--watch <id>]
+ *   guardian events [--watch <id>] [--retention-days 14]
  *   guardian report --watch <id>
  *
- * 退出码：0 正常；2 参数/环境错误；130 SIGINT。
+ * 退出码：0 正常；2 参数/环境错误；3 已有监督者在跑（单例）；130 SIGINT。
  *
  * @module
  */
@@ -36,6 +36,7 @@ import type { ShellExec } from "../src/watcher/llm.ts";
 import { runWatch, PANEL_MEMBER_TIMEOUT_MS } from "../src/watcher/loop.ts";
 import type { WatchOptions, WatchServices } from "../src/watcher/loop.ts";
 import { generateReport } from "../src/watcher/report.ts";
+import { cleanupOldWatches, DEFAULT_RETENTION_DAYS } from "../src/retention.ts";
 import { runPanel } from "../src/panel/runner.ts";
 import type { PanelOptions, PanelServices } from "../src/panel/runner.ts";
 
@@ -51,6 +52,7 @@ export interface WatchCliOptions {
   budgetMin: number;
   remindMax: number;
   llmMaxCalls: number;
+  retentionDays: number;
 }
 
 export function parseWatchArgs(argv: string[]): WatchCliOptions | string {
@@ -62,6 +64,7 @@ export function parseWatchArgs(argv: string[]): WatchCliOptions | string {
     budgetMin: 120,
     remindMax: 5,
     llmMaxCalls: 3,
+    retentionDays: DEFAULT_RETENTION_DAYS,
   };
   let positionals: string[] = [];
   for (let i = 0; i < argv.length; i++) {
@@ -73,7 +76,8 @@ export function parseWatchArgs(argv: string[]): WatchCliOptions | string {
       case "--llm":
       case "--budget-min":
       case "--remind-max":
-      case "--llm-max-calls": {
+      case "--llm-max-calls":
+      case "--retention-days": {
         const value = argv[i + 1];
         if (value === undefined) return `${arg} 缺少参数值`;
         if (arg === "--terminal") opts.terminal = value;
@@ -88,6 +92,10 @@ export function parseWatchArgs(argv: string[]): WatchCliOptions | string {
           const n = Number(value);
           if (!Number.isInteger(n) || n < 1) return "--remind-max 必须是正整数";
           opts.remindMax = n;
+        } else if (arg === "--retention-days") {
+          const n = Number(value);
+          if (!Number.isInteger(n) || n < 1) return "--retention-days 必须是正整数（天）";
+          opts.retentionDays = n;
         } else {
           const n = Number(value);
           if (!Number.isInteger(n) || n < 1) return "--llm-max-calls 必须是正整数";
@@ -187,16 +195,24 @@ export function parsePanelArgs(argv: string[]): PanelCliOptions | string {
 
 export interface IdCliOptions {
   watch: string | null;
+  retentionDays: number;
 }
 
 export function parseIdArgs(argv: string[]): IdCliOptions | string {
-  const opts: IdCliOptions = { watch: null };
+  const opts: IdCliOptions = { watch: null, retentionDays: DEFAULT_RETENTION_DAYS };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === "--watch") {
       const value = argv[i + 1];
       if (value === undefined) return "--watch 缺少参数值";
       opts.watch = value;
+      i++;
+    } else if (arg === "--retention-days") {
+      const value = argv[i + 1];
+      if (value === undefined) return "--retention-days 缺少参数值";
+      const n = Number(value);
+      if (!Number.isInteger(n) || n < 1) return "--retention-days 必须是正整数（天）";
+      opts.retentionDays = n;
       i++;
     } else if (arg.startsWith("-")) {
       return `未知参数: ${arg}`;
@@ -326,6 +342,11 @@ async function cmdWatch(argv: string[]): Promise<number> {
   const home = resolveHome();
   const dirs = dirsFor(home);
   const orca = new OrcaCli();
+  // V1.1 证据卫生：启动前清理超保留期（默认 14 天）的旧 watch 产物。
+  const removed = cleanupOldWatches(dirs, parsed.retentionDays);
+  if (removed.length > 0) {
+    console.log(`guardian: 已清理超保留期（${parsed.retentionDays} 天）的旧记录: ${removed.join(", ")}`);
+  }
 
   let handle: string;
   let channel: WatchServices["channel"];
@@ -388,6 +409,13 @@ async function cmdWatch(argv: string[]): Promise<number> {
 
   console.log(`guardian: 开始监督 ${watchId}（${target.kind}，预算 ${parsed.budgetMin} 分钟）`);
   const result = await runWatch(watchOpts, services);
+  if (result.denied !== null) {
+    // 启动被拒：单例锁（退出码 3）或状态读取失败中止启动（退出码 4，可重试）——
+    // 打印原因并按各自的错误退出码退出（不得一律压成 3，否则用户无法区分"已有
+    // 监督者在跑"与"状态暂不可读，重试即可"）。
+    console.error(`guardian: ${result.denied}`);
+    return result.exitCode;
+  }
   console.log(`guardian: 监督结束，汇报: ${result.reportPath ?? "(写入失败)"}`);
   return result.exitCode;
 }
@@ -436,6 +464,11 @@ async function cmdEvents(argv: string[]): Promise<number> {
     return 2;
   }
   const dirs = dirsFor(resolveHome());
+  // V1.1 证据卫生：启动时清理超保留期（默认 14 天）的旧 watch 产物。
+  const removed = cleanupOldWatches(dirs, parsed.retentionDays);
+  if (removed.length > 0) {
+    console.log(`已清理超保留期（${parsed.retentionDays} 天）的旧记录: ${removed.join(", ")}`);
+  }
   const events = new EventStore(dirs.events);
   if (parsed.watch !== null) {
     const read = events.readState(parsed.watch);
@@ -478,11 +511,17 @@ async function cmdReport(argv: string[]): Promise<number> {
     console.error("guardian report: 没有可用的监督记录（先运行 guardian watch）");
     return 2;
   }
-  const state = await stateStore.load(watchId);
-  if (state === null) {
+  const loaded = await stateStore.load(watchId);
+  if (loaded.kind === "missing") {
     console.error(`guardian report: 找不到 ${watchId} 的状态记录`);
     return 2;
   }
+  if (loaded.kind === "error") {
+    // W5：状态读取真失败 ≠ 无记录——显式报错退出，不得当作"无状态"静默处理
+    console.error(`guardian report: ${watchId} 状态读取失败（${loaded.reason}），无法生成报告`);
+    return 2;
+  }
+  const state = loaded.state;
   const report = generateReport(state, events.readState(watchId));
   const path = join(dirs.reports, `${watchId}.md`);
   // m1：reports 目录可能尚未创建（如仅跑过 watch 未成功收尾），写前 mkdir recursive。
@@ -497,11 +536,11 @@ function usage(): void {
   console.log(`guardian — 跨 CLI 运行期监督与讨论组编排
 
 用法：
-  guardian watch --terminal <handle> [--session <file>] [--llm "<cmd>"] [--budget-min 120] [--remind-max 5] [--llm-max-calls 3]
+  guardian watch --terminal <handle> [--session <file>] [--llm "<cmd>"] [--budget-min 120] [--remind-max 5] [--llm-max-calls 3] [--retention-days 14]
   guardian watch --file <会话文件>
   guardian panel "<问题>" [--n 3] [--backend orca|headless] [--out <dir>] [--materials <p>...]
                   [--agent <name>] [--member-cmd "<cmd>"] [--synthesize-cmd "<cmd>"] [--no-synthesize]
-  guardian events [--watch <id>]
+  guardian events [--watch <id>] [--retention-days 14]
   guardian report --watch <id>
 
 数据目录：~/.agent-guardian/（可用 AGENT_GUARDIAN_HOME 覆盖）。

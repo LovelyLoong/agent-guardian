@@ -15,6 +15,7 @@
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { redactText } from "./redact.ts";
 import type { BeatFacts } from "../targets/types.ts";
 import type { WatchState } from "./state.ts";
 import type { DecisionAction } from "./decide.ts";
@@ -176,7 +177,10 @@ export function makeLlmConsult(opts: {
     try {
       mkdirSync(opts.evidenceDir, { recursive: true });
       path = join(opts.evidenceDir, `${opts.watchId}-${Date.now()}.json`);
-      writeFileSync(path, JSON.stringify(evidence, null, 2) + "\n", "utf-8");
+      // V1.1 证据卫生：证据包可能含用户文本（尾部摘要/事件/任务摘要），
+      // 写入前执行秘密模式过滤（命中替换为 [REDACTED]）。
+      const redacted = redactText(JSON.stringify(evidence, null, 2) + "\n");
+      writeFileSync(path, redacted.text, "utf-8");
     } catch (err) {
       return invalid(`证据包写入失败: ${String(err)}`);
     }

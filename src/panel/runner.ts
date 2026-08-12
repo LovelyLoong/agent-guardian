@@ -18,6 +18,7 @@ import { join } from "node:path";
 import type { OrcaCli } from "../orca.ts";
 import { findDeepString } from "../orca.ts";
 import type { EventStore } from "../events.ts";
+import { readFileSyncRetry } from "../shared/fs.ts";
 import type { ShellExec } from "../watcher/llm.ts";
 import { splitCommand } from "../watcher/llm.ts";
 
@@ -309,7 +310,8 @@ export function specForMember(opts: PanelOptions, i: number): string {
 
 function excerpt(path: string): string {
   try {
-    const text = readFileSync(path, "utf-8");
+    // EBUSY/EPERM（成员进程并发写锁）→ 瞬态重试，重试耗尽才视为材料不可读
+    const text = readFileSyncRetry(path);
     const first = text.slice(0, MATERIAL_EXCERPT_CHARS).replace(/\r\n/g, "\n");
     return first.length < text.length ? first + "\n…（节选）" : first;
   } catch {

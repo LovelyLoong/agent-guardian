@@ -7,7 +7,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, existsSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -21,6 +21,7 @@ import {
 import { EventStore } from "../src/events.ts";
 import { OrcaCli } from "../src/orca.ts";
 import { dirsFor } from "../src/home.ts";
+import { STATE_LOAD_ERROR_EXIT_CODE } from "../src/watcher/loop.ts";
 import type { ShellExec } from "../src/watcher/llm.ts";
 
 describe("makeWatchId（m3：全路径短哈希防撞名）", () => {
@@ -67,6 +68,16 @@ describe("parseWatchArgs", () => {
     assert.strictEqual(opts.remindMax, 5);
     assert.strictEqual(opts.llmMaxCalls, 3);
     assert.strictEqual(opts.llm, null);
+    assert.strictEqual(opts.retentionDays, 14);
+  });
+
+  it("--retention-days 解析（watch）", () => {
+    const opts = parseWatchArgs(["--file", "s.jsonl", "--retention-days", "30"]);
+    assert.ok(typeof opts !== "string");
+    assert.strictEqual(opts.retentionDays, 30);
+    assert.ok(typeof parseWatchArgs(["--file", "s.jsonl", "--retention-days", "0"]) === "string");
+    assert.ok(typeof parseWatchArgs(["--file", "s.jsonl", "--retention-days", "abc"]) === "string");
+    assert.ok(typeof parseWatchArgs(["--file", "s.jsonl", "--retention-days"]) === "string");
   });
 
   it("缺值 / 冲突 / 未知参数 → 错误字符串", () => {
@@ -120,11 +131,21 @@ describe("parseIdArgs", () => {
     const withWatch = parseIdArgs(["--watch", "w1"]);
     assert.ok(typeof withWatch !== "string");
     assert.strictEqual(withWatch.watch, "w1");
+    assert.strictEqual(withWatch.retentionDays, 14);
     const empty = parseIdArgs([]);
     assert.ok(typeof empty !== "string");
     assert.strictEqual(empty.watch, null);
     assert.ok(typeof parseIdArgs(["--watch"]) === "string");
     assert.ok(typeof parseIdArgs(["x"]) === "string");
+  });
+
+  it("--retention-days 解析（events）", () => {
+    const opts = parseIdArgs(["--retention-days", "7"]);
+    assert.ok(typeof opts !== "string");
+    assert.strictEqual(opts.retentionDays, 7);
+    assert.ok(typeof parseIdArgs(["--retention-days", "0"]) === "string");
+    assert.ok(typeof parseIdArgs(["--retention-days", "x"]) === "string");
+    assert.ok(typeof parseIdArgs(["--retention-days"]) === "string");
   });
 });
 
@@ -284,6 +305,93 @@ describe("CLI 子进程退出码（临时 AGENT_GUARDIAN_HOME）", () => {
 
   it("report 无记录 → 退出 2", () => {
     assert.strictEqual(run(["report"]).status, 2);
+  });
+
+  it("events 启动时清理超保留期旧记录（V1.1 证据卫生）", () => {
+    const home = mkdtempSync(join(tmpdir(), "ag-cli-keep-"));
+    mkdirSync(join(home, "state"), { recursive: true });
+    mkdirSync(join(home, "events"), { recursive: true });
+    const oldState = join(home, "state", "w-ancient.json");
+    writeFileSync(oldState, "{}", "utf-8");
+    // 回拨 mtime 到 30 天前（默认保留期 14 天）
+    const ancient = new Date(Date.now() - 30 * 86_400_000);
+    utimesSync(oldState, ancient, ancient);
+    writeFileSync(join(home, "events", "w-fresh.jsonl"), "{}", "utf-8");
+    const res = spawnSync(process.execPath, [cli, "events"], {
+      encoding: "utf-8",
+      env: { ...process.env, AGENT_GUARDIAN_HOME: home },
+    });
+    assert.strictEqual(res.status, 0);
+    assert.ok(res.stdout.includes("w-ancient"), "清理日志应点名被删 watch");
+    assert.ok(!existsSync(oldState), "超保留期状态文件已删");
+    assert.ok(existsSync(join(home, "events", "w-fresh.jsonl")), "新近记录保留");
+  });
+
+  it("watch 单例锁：已有未过期租约且属主进程存活 → 拒绝启动退出 3（V1.1）", () => {
+    const home = mkdtempSync(join(tmpdir(), "ag-cli-single-"));
+    const session = join(home, "session.jsonl");
+    writeFileSync(session, '{"type":"session"}\n', "utf-8");
+    const watchId = makeWatchId(session, session);
+    mkdirSync(join(home, "state"), { recursive: true });
+    // 模拟另一个监督者正在运行：属主 = 本测试进程（存活），租约未过期
+    writeFileSync(
+      join(home, "state", `${watchId}.json`),
+      JSON.stringify({
+        watchId,
+        watchRunId: "run-x",
+        generation: 1,
+        status: "active",
+        ownerPid: process.pid,
+        leaseExpiresAt: Date.now() + 600_000,
+        settledBeats: 0,
+        cursor: "",
+        cooldownUntil: {},
+        remindCount: 0,
+        remindHistory: [],
+        escalationCount: 0,
+        llmCalls: 0,
+        startedAt: Date.now() - 1_000,
+        budgetMs: 120_000,
+        safetyWarningSent: false,
+        safetyWarningTrigger: null,
+        eventsDegraded: false,
+        targetKind: "pi",
+        channelKind: "file",
+        handle: session,
+        sessionFile: session,
+        lastAction: null,
+      }),
+      "utf-8",
+    );
+    const res = spawnSync(process.execPath, [cli, "watch", "--file", session], {
+      encoding: "utf-8",
+      env: { ...process.env, AGENT_GUARDIAN_HOME: home },
+    });
+    assert.strictEqual(res.status, 3, "单例冲突 → 退出码 3");
+    assert.ok(
+      res.stdout.includes("已有监督者正在运行") || res.stderr.includes("已有监督者正在运行"),
+      "应提示已有监督者在跑",
+    );
+  });
+
+  it("watch 状态读取失败 → 中止启动退出码 4，不写任何状态/事件/报告（W5 终审裁决）", () => {
+    const home = mkdtempSync(join(tmpdir(), "ag-cli-loade-"));
+    const session = join(home, "session.jsonl");
+    writeFileSync(session, '{"type":"session"}\n', "utf-8");
+    const watchId = makeWatchId(session, session);
+    // 状态"文件"做成目录：readFileSync 抛 EISDIR（非瞬态、非 ENOENT）→ load 返回 error
+    mkdirSync(join(home, "state", `${watchId}.json`), { recursive: true });
+    const res = spawnSync(process.execPath, [cli, "watch", "--file", session], {
+      encoding: "utf-8",
+      env: { ...process.env, AGENT_GUARDIAN_HOME: home },
+    });
+    assert.strictEqual(res.status, STATE_LOAD_ERROR_EXIT_CODE, "状态读取失败 → 退出码 4（可重试）");
+    assert.ok(
+      res.stderr.includes("状态文件读取失败") && res.stderr.includes("EISDIR"),
+      `stderr 应有清晰错误含 reason（实测: ${res.stderr}）`,
+    );
+    assert.ok(!existsSync(join(home, "events", `${watchId}.jsonl`)), "不得写事件文件");
+    assert.ok(!existsSync(join(home, "reports", `${watchId}.md`)), "不得写报告");
   });
 
   it("report：reports 目录不存在时也能生成汇报并退出 0（m1：写前 mkdir recursive）", () => {

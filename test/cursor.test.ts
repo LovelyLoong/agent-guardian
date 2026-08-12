@@ -9,17 +9,18 @@
 
 import assert from "node:assert";
 import { describe, it } from "node:test";
+import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventStore } from "../src/events.ts";
 import { StateStore, initialState } from "../src/watcher/state.ts";
-import type { WatchState } from "../src/watcher/state.ts";
+import type { WatchState, LedgerLine } from "../src/watcher/state.ts";
 import { runWatch, MAX_CONSECUTIVE_FACTS_ERRORS } from "../src/watcher/loop.ts";
 import type { WatchOptions, WatchServices } from "../src/watcher/loop.ts";
 import type { Channel, ReadResult } from "../src/channels/types.ts";
 import type { TargetAdapter, BeatFacts } from "../src/targets/types.ts";
-import type { Signal } from "../../pi-task-governor/src/contract.ts";
+import type { Signal } from "../src/shared/contract.ts";
 import type { LlmResult, EvidencePack } from "../src/watcher/llm.ts";
 import { signalKey } from "../src/watcher/decide.ts";
 import { generateReport } from "../src/watcher/report.ts";
@@ -58,6 +59,11 @@ class ScriptedChannel implements Channel {
   async stop(_handle: string): Promise<void> {
     this.stops++;
   }
+
+  /** V1.1 停止验证替身：默认立即判定已停（不轮询）。 */
+  async verifyStopped(_handle: string, _opts?: import("../src/channels/types.ts").StopVerifyOptions): Promise<"verified" | "unverified"> {
+    return "verified";
+  }
 }
 
 /** read 永远抛异常的通道（B1 探针场景：100ms 内反复 read 失败必须 ≤2 次即收尾）。 */
@@ -77,6 +83,10 @@ class ObservingChannel extends ScriptedChannel {
 
   override async stop(): Promise<void> {
     throw new Error("stop 在纯观察通道不可用");
+  }
+
+  override async verifyStopped(): Promise<"verified" | "unverified"> {
+    throw new Error("stop 验证在纯观察通道不可用");
   }
 }
 
@@ -243,10 +253,12 @@ function spinSignals(): Signal[] {
 /**
  * 取 w-test 状态；空目录（尚无状态文件）时先落盘初始状态再返回。
  * 状态机语义：load 对缺失文件返回 null（=首次运行），测试要预置状态必须先建。
+ * V1.1：预置状态模拟"崩溃后残留"——属主进程必须是已死 pid（否则启动裁决
+ * 视为单例占用而拒绝启动），租约未过期（否则视为新任务不继承）。
  */
 async function seedState(h: ReturnType<typeof harness>): Promise<WatchState> {
-  const existing = await h.services.state.load("w-test");
-  if (existing !== null) return existing;
+  const loaded = await h.services.state.load("w-test");
+  if (loaded.kind === "ok") return loaded.state;
   const fresh = initialState({
     watchId: "w-test",
     budgetMs: h.watchOpts.budgetMs,
@@ -256,8 +268,27 @@ async function seedState(h: ReturnType<typeof harness>): Promise<WatchState> {
     sessionFile: "f.jsonl",
     now: 0,
   });
+  // 模拟崩溃残留：属主已死（进程退出后 pid 失效）+ 租约未过期
+  fresh.ownerPid = await deadPid();
+  fresh.leaseExpiresAt = 1_000_000_000;
   await h.services.state.save("w-test", fresh);
   return fresh;
+}
+
+/** 已退出子进程的 pid（进程级"已死"证据；pid 复用在此窗口内可忽略）。 */
+function deadPid(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+    child.on("error", reject);
+    child.on("exit", () => resolve(child.pid ?? 0));
+  });
+}
+
+/** load 并断言成功（W5：load 返回 ok/missing/error 可区分结果，形状专项断言见 state.test.ts）。 */
+async function loadOk(store: StateStore, watchId: string): Promise<WatchState> {
+  const loaded = await store.load(watchId);
+  assert.strictEqual(loaded.kind, "ok", `load(${watchId}) 应为 ok（实测 ${JSON.stringify(loaded)}）`);
+  return loaded.kind === "ok" ? loaded.state : (undefined as never);
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +321,7 @@ describe("游标纪律", () => {
     assert.strictEqual(h.target.calls, 2);
     // 取证收到的是上次已消费的检查点（初始 ""，第一拍后 "10"），成功后状态游标推进到通道游标
     assert.deepStrictEqual(h.target.cursors, ["", "10"]);
-    const loaded = await h.services.state.load("w-test");
+    const loaded = await loadOk(h.services.state, "w-test");
     assert.strictEqual(loaded?.cursor, "20");
   });
 });
@@ -371,7 +402,7 @@ describe("安全网与停止", () => {
     assert.ok(evs.some((e) => e.type === "stop"));
     assert.ok(evs.some((e) => e.type === "stop-issued"));
     assert.ok(!evs.some((e) => e.type === "budget-expired-idle"), "活跃目标不得走静止直接收尾");
-    const loaded = await h.services.state.load("w-test");
+    const loaded = await loadOk(h.services.state, "w-test");
     assert.strictEqual(loaded?.safetyWarningSent, true, "未改善时闩锁不得清除");
     assert.strictEqual(loaded?.safetyWarningTrigger, "budget", "触发源应持久化为 budget");
   });
@@ -463,8 +494,8 @@ describe("安全网与停止", () => {
     assert.ok(evs.some((e) => e.type === "stop"));
     assert.ok(evs.some((e) => e.type === "stop-issued"));
     assert.ok(evs.some((e) => e.type === "finish" && String(e.reason).includes("安全网收尾")));
-    const loaded = await h.services.state.load("w-test");
-    assert.strictEqual(loaded?.safetyWarningSent, true, "未改善时闩锁不得清除");
+    const loaded = await loadOk(h.services.state, "w-test");
+    assert.strictEqual(loaded.safetyWarningSent, true, "未改善时闩锁不得清除");
   });
 
   it("LIVE-1 真实改善：warning→触发信号消失且自警告起 newToolCalls>0 → 清闩 → 后续静止拍不得 stop", async () => {
@@ -483,7 +514,7 @@ describe("安全网与停止", () => {
     assert.strictEqual(result.exitCode, 0);
     assert.strictEqual(h.channel.stops, 0, "真实改善后不得 stop");
     assert.ok(h.channel.sends.some((s) => s.includes("警告")), "第一拍应发最后警告");
-    const loaded = await h.services.state.load("w-test");
+    const loaded = await loadOk(h.services.state, "w-test");
     assert.strictEqual(loaded?.safetyWarningSent, false, "真实改善后闩锁必须清除并持久化");
     assert.strictEqual(loaded?.safetyWarningTrigger, null, "清闩后触发源必须重置");
     const evs = h.services.events.read("w-test");
@@ -513,8 +544,8 @@ describe("安全网与停止", () => {
     assert.ok(!evs.some((e) => e.type === "safety-warning-cleared"), "幻影改善不得清闩");
     assert.ok(evs.some((e) => e.type === "stop"));
     assert.ok(evs.some((e) => e.type === "stop-issued"));
-    const loaded = await h.services.state.load("w-test");
-    assert.strictEqual(loaded?.safetyWarningSent, true, "未真实改善时闩锁不得清除");
+    const loaded = await loadOk(h.services.state, "w-test");
+    assert.strictEqual(loaded.safetyWarningSent, true, "未真实改善时闩锁不得清除");
   });
 
   it("残差 blocker：警告后游标前进+触发信号消失+newToolCalls=0 → 次拍即 stop，不静默续跑", async () => {
@@ -548,7 +579,7 @@ describe("安全网与停止", () => {
     assert.ok(evs.some((e) => e.type === "stop"));
     assert.ok(evs.some((e) => e.type === "stop-issued"));
     assert.ok(evs.some((e) => e.type === "finish" && String(e.reason).includes("安全网收尾")));
-    const loaded = await h.services.state.load("w-test");
+    const loaded = await loadOk(h.services.state, "w-test");
     assert.strictEqual(loaded?.safetyWarningSent, true, "未改善时闩锁不得清除");
     assert.strictEqual(loaded?.safetyWarningTrigger, "spin", "触发源应保持为 spin");
   });
@@ -579,7 +610,7 @@ describe("安全网与停止", () => {
     const evs = h.services.events.read("w-test");
     assert.ok(evs.some((e) => e.type === "safety-warning-cleared"));
     assert.ok(!evs.some((e) => e.type === "stop"));
-    const loaded = await h.services.state.load("w-test");
+    const loaded = await loadOk(h.services.state, "w-test");
     assert.strictEqual(loaded?.safetyWarningSent, false, "真实改善后闩锁必须清除并持久化");
     assert.strictEqual(loaded?.safetyWarningTrigger, null, "清闩后触发源必须重置");
   });
@@ -771,8 +802,7 @@ describe("事件与状态落盘", () => {
     await runWatch(h.watchOpts, h.services);
     const evs = h.services.events.read("w-test");
     assert.ok(evs.some((e) => e.type === "watch_resume" && e.settledBeats === 42));
-    const loaded = await h.services.state.load("w-test");
-    assert.ok(loaded !== null);
+    const loaded = await loadOk(h.services.state, "w-test");
     assert.ok(loaded.settledBeats >= 42);
     assert.strictEqual(loaded.cursor, "50");
   });
@@ -794,7 +824,7 @@ describe("取证与回调异常降级", () => {
     assert.deepStrictEqual(h.target.cursors, ["", ""]);
     const evs = h.services.events.read("w-test");
     assert.ok(evs.some((e) => e.type === "facts-error"));
-    const loaded = await h.services.state.load("w-test");
+    const loaded = await loadOk(h.services.state, "w-test");
     assert.strictEqual(loaded?.cursor, "10");
   });
 
@@ -965,7 +995,7 @@ describe("M2 会话适配器无进展探针（--terminal + --session 组合）",
     assert.ok(!evs.some((e) => e.type === "safety-warning-cleared"));
     assert.ok(evs.some((e) => e.type === "stop"));
     assert.ok(evs.some((e) => e.type === "stop-issued"));
-    const loaded = await h.services.state.load("w-test");
+    const loaded = await loadOk(h.services.state, "w-test");
     assert.strictEqual(loaded?.safetyWarningTrigger, "budget", "触发源应持久化（崩溃续跑不丢）");
   });
 
@@ -981,7 +1011,7 @@ describe("M2 会话适配器无进展探针（--terminal + --session 组合）",
     assert.strictEqual(result.exitCode, 0);
     assert.strictEqual(h.channel.stops, 0, "会话文件有新增调用（newToolCalls>0）→ 不得 stop");
     assert.strictEqual(h.target.calls, 1, "只做一次 M2 探针取证");
-    const loaded = await h.services.state.load("w-test");
+    const loaded = await loadOk(h.services.state, "w-test");
     assert.strictEqual(loaded?.safetyWarningSent, false, "判定改善后闩锁必须清除并持久化");
     const evs = h.services.events.read("w-test");
     assert.ok(evs.some((e) => e.type === "safety-warning-cleared"));
@@ -1001,7 +1031,7 @@ describe("M2 会话适配器无进展探针（--terminal + --session 组合）",
     assert.strictEqual(result.exitCode, 0);
     assert.strictEqual(h.channel.stops, 1, "探针无新增调用 → 必须 stop");
     assert.strictEqual(h.target.calls, 1, "先取证一次再判（M2 探针）");
-    const loaded = await h.services.state.load("w-test");
+    const loaded = await loadOk(h.services.state, "w-test");
     assert.strictEqual(loaded?.safetyWarningSent, true, "未改善时闩锁不得清除");
     const evs = h.services.events.read("w-test");
     assert.ok(evs.some((e) => e.type === "stop"));
@@ -1023,7 +1053,7 @@ describe("M2 会话适配器无进展探针（--terminal + --session 组合）",
     assert.strictEqual(result.exitCode, 0);
     assert.strictEqual(h.channel.stops, 0, "会话文件有新增调用 → 不得 stop");
     assert.strictEqual(h.target.calls, 2, "探针 1 次 + 清闩后正常取证 1 次");
-    const loaded = await h.services.state.load("w-test");
+    const loaded = await loadOk(h.services.state, "w-test");
     assert.strictEqual(loaded?.safetyWarningSent, false, "判定改善后闩锁必须清除并持久化");
     const evs = h.services.events.read("w-test");
     assert.ok(evs.some((e) => e.type === "safety-warning-cleared"));
@@ -1132,7 +1162,7 @@ describe("M4 append 失败降级", () => {
     ];
     const result = await runWatch(h.watchOpts, h.services);
     assert.strictEqual(result.exitCode, 0);
-    const loaded = await h.services.state.load("w-test");
+    const loaded = await loadOk(h.services.state, "w-test");
     assert.strictEqual(loaded?.eventsDegraded, true, "append 失败应标记状态");
     const report = (await import("node:fs")).readFileSync(result.reportPath!, "utf-8");
     assert.ok(report.includes("事件落盘曾失败"), "报告应显式标注记录降级");
@@ -1159,7 +1189,7 @@ describe("M3 append 失败传播（steer/stop 路径统一包装）", () => {
     ];
     const result = await runWatch(h.watchOpts, h.services);
     assert.strictEqual(result.exitCode, 0);
-    const loaded = await h.services.state.load("w-test");
+    const loaded = await loadOk(h.services.state, "w-test");
     assert.strictEqual(loaded?.eventsDegraded, true, "steer 路径 append 失败也应标记降级");
   });
 
@@ -1184,9 +1214,102 @@ describe("M3 append 失败传播（steer/stop 路径统一包装）", () => {
     const report = (await import("node:fs")).readFileSync(result.reportPath!, "utf-8");
     assert.ok(report.includes("事件落盘曾失败"), "stop 路径 append 失败应标记 degraded 并显式标注");
     // m1：终态事件发生后状态必须再次落盘——guardian report 重载不丢降级标记
-    const loaded = await h.services.state.load("w-test");
+    const loaded = await loadOk(h.services.state, "w-test");
     assert.strictEqual(loaded?.eventsDegraded, true, "终态事件后的状态重存必须带上降级标记");
     const reportReload = generateReport(loaded!, h.services.events.readState("w-test"));
     assert.ok(reportReload.includes("事件落盘曾失败"), "重载状态重新生成汇报也应标注降级");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T2 finish 丢锁回归（W4 收尾归属校验）：leaseWinner 返回他人时
+// 不得写 save/报告（事件先行落一行冗余 finish，属可自愈，见 W4 声明），
+// 仅追加自己的 release 行
+// ---------------------------------------------------------------------------
+
+describe("T2 finish 丢锁回归（收尾归属校验）", () => {
+  it("finish 时锁已被他人接管（W4-① save 前校验拦截）→ 冗余 finish 事件一行、无报告、state 未覆写、仅追加自己的 release 行", async () => {
+    const h = harness({ budgetMs: 10_000 });
+    h.channel.reads = [{ text: "a", cursor: "10", alive: true }];
+    const store = h.services.state;
+    const origLeaseWinner = store.leaseWinner.bind(store);
+    // 收尾归属校验探针：仅当收尾触发事件（budget-expired-idle）已落盘后，让
+    // leaseWinner 返回"他人"——模拟 finish 期间锁已被其他进程接管（真实场景：
+    // 本运行租约过期/断链后他人 claim 当选）。收尾前的续租调用不受影响。
+    store.leaseWinner = ((watchId: string, now: number) => {
+      if (h.services.events.read("w-test").some((e) => e.type === "budget-expired-idle")) {
+        return { runId: "run-other", ownerPid: 999_999, leaseExpiresAt: Number.MAX_SAFE_INTEGER };
+      }
+      return origLeaseWinner(watchId, now);
+    }) as typeof store.leaseWinner;
+    const result = await runWatch(h.watchOpts, h.services);
+    assert.strictEqual(result.exitCode, 0);
+    // W4 声明：事件追加先行可保留——已落一行冗余 finish 事件（自愈，可接受）
+    const evs = h.services.events.read("w-test");
+    assert.strictEqual(evs.filter((e) => e.type === "finish").length, 1, "恰一行冗余 finish 事件（W4 声明内）");
+    // 无报告生成
+    assert.strictEqual(result.reportPath, null, "丢锁收尾不写报告");
+    assert.ok(!existsSync(join(h.dir, "reports", "w-test.md")), "报告文件不得生成");
+    // state 未覆写：磁盘终态仍是收尾前的 active（finish 的 status=finished 未落盘，fencing）
+    const loaded = await loadOk(h.services.state, "w-test");
+    assert.strictEqual(loaded.status, "active", "丢锁收尾不得覆写 state（fencing）");
+    // 自己的 release 行已追加（release 只杀死自己的 runId，永远安全）
+    const ledger = store.readLedger("w-test").lines;
+    const claim = ledger.find((l): l is Extract<LedgerLine, { op: "claim" }> => l.op === "claim");
+    assert.ok(claim !== undefined, "本运行 claim 应在账本中");
+    assert.ok(
+      ledger.some((l) => l.op === "release" && l.runId === claim.runId),
+      "丢锁收尾必须追加自己的 release 行",
+    );
+  });
+
+  it("W4-②：save 后 read-back 复检检出丢锁（校验后注入接管）→ stderr 警告、仅 release 落地、无后续共享写", async () => {
+    const h = harness({ budgetMs: 10_000 });
+    h.channel.reads = [{ text: "a", cursor: "10", alive: true }];
+    const store = h.services.state;
+    const origLeaseWinner = store.leaseWinner.bind(store);
+    const stderr: string[] = [];
+    const origError = console.error;
+    console.error = (msg?: unknown) => {
+      stderr.push(String(msg));
+    };
+    try {
+      let checkCalls = 0;
+      // 注入接管：第一次归属校验（终态 save 前最后一跳，W4-①）仍归己；第二次
+      // （save 后 read-back 复检，W4-②）返回"他人"——模拟校验通过后、终态 rename
+      // 前被其他进程 claim 接管（微秒级窗口）。
+      store.leaseWinner = ((watchId: string, now: number) => {
+        checkCalls++;
+        if (checkCalls >= 2) {
+          return { runId: "run-other", ownerPid: 999_999, leaseExpiresAt: Number.MAX_SAFE_INTEGER };
+        }
+        return origLeaseWinner(watchId, now);
+      }) as typeof store.leaseWinner;
+      const result = await runWatch(h.watchOpts, h.services);
+      assert.strictEqual(result.exitCode, 0);
+      // read-back 复检检出丢锁 → stderr 警告（W4-②）
+      assert.ok(
+        stderr.some((s) => s.includes("复检发现单例锁已被其他进程接管")),
+        `stderr 应有 read-back 丢锁警告（实测: ${stderr.join(" | ")}）`,
+      );
+      // 此后不再写任何共享文件：无报告、无报告写失败降级事件
+      assert.strictEqual(result.reportPath, null, "复检丢锁后不得写报告");
+      assert.ok(!existsSync(join(h.dir, "reports", "w-test.md")), "报告文件不得生成");
+      const evs = h.services.events.read("w-test");
+      assert.ok(!evs.some((e) => e.type === "report-write-failed"), "复检丢锁后不得追加降级事件");
+      // 复检丢锁前的 save 是合法的（save 时仍归己）：终态 status=finished 已落盘
+      const loaded = await loadOk(h.services.state, "w-test");
+      assert.strictEqual(loaded.status, "finished", "复检丢锁前的终态 save 应已落地（当时仍归己）");
+      // 仅追加自己的 release 行（release 只杀死自己的 runId，永远安全）
+      const ledger = store.readLedger("w-test").lines;
+      const claim = ledger.find((l): l is Extract<LedgerLine, { op: "claim" }> => l.op === "claim");
+      assert.ok(claim !== undefined, "本运行 claim 应在账本中");
+      assert.ok(
+        ledger.some((l) => l.op === "release" && l.runId === claim.runId),
+        "复检丢锁后必须追加自己的 release 行",
+      );
+    } finally {
+      console.error = origError;
+    }
   });
 });

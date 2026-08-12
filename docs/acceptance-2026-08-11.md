@@ -45,3 +45,14 @@
 2. 自动挂接新终端（Orca automations 集成）留接口未实现（design §8）。
 3. 远端 worker（--on）与多 watcher 协调未实现（design §8）。
 4. 同字节数不同内容的会话文件重建不重置（注释已声明；会话文件按契约 append-only）。
+
+---
+
+## V1.1 增补验收：地基加固 + 锁协议 + Windows EBUSY 硬化（v0.2.0）
+
+- 日期：2026-08-12
+- 触发：独立批判（Sidecar Watchdog vs Supervisor）+ 用户多窗口设计语料；本轮仅清地基欠债，V2 语义层见 design.md §9。
+- 内容：①运行代际/租约/单例锁（append-only 账本选举+断链永久死亡+fencing）；②waitIdle 未知形状→unknown；③stop 验证；④信号引擎正主迁入本包（pi-task-governor shim 反向导入，本包可独立 clone）；⑤证据保留期+脱敏；⑥Windows EBUSY/EPERM 并发读写瞬态重试全覆盖；⑦load error 中止启动（exit 4 零写入）。
+- 实现：deepseek/deepseek-v4-flash:max（公司通道额度耗尽后切个人通道）；验收：openai-codex/gpt-5.6-luna:max 多轮（锁协议经 5+ 轮跨进程探针收敛：claim 非原子→回收 TOCTOU→settle 窗口→EBUSY 胜者崩溃假象→写路径无重试→fencing 顺序→finish TOCTOU 缓解→load 中止）。
+- 终审证据：275/275 ×2 全绿（governor 95/95）；跨进程 barrier（30-50 子进程）恰 1 胜者零崩溃多轮；W5 调度者亲测探针（load error → exit 4 + 零共享写入）。
+- 已知残余（裁决接受）：finish 校验→rename 微秒级窗口无 OS 级可移植原子锁可消除，后果自愈（注释声明）；E-SafeNet 透明加密环境下非白名单进程读到密文——子代理验收的读文件类探针在此环境不可靠，读代码类终审证据以调度者主会话为准。

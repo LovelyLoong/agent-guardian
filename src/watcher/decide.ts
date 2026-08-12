@@ -20,8 +20,8 @@
  * @module
  */
 
-import { computeArgsHash } from "../../../pi-task-governor/src/signals.ts";
-import type { Signal } from "../../../pi-task-governor/src/contract.ts";
+import { computeArgsHash } from "../shared/signals.ts";
+import type { Signal } from "../shared/contract.ts";
 import { sanitizeText } from "./sanitize.ts";
 import type { BeatFacts } from "../targets/types.ts";
 import type { WatchState } from "./state.ts";

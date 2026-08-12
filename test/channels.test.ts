@@ -112,7 +112,7 @@ function jsonResult(data: unknown, ok = true): ExecResult {
 }
 
 describe("OrcaChannel（替身 exec）", () => {
-  it("waitIdle：satisfied → idle；timeout 错误 → timeout；其他错误 → stale", async () => {
+  it("waitIdle：satisfied → idle；timeout 错误 → timeout；ok 但形状不明 → unknown；其他错误 → stale", async () => {
     const calls: string[][] = [];
     const cli = stubCli((args) => {
       calls.push(args);
@@ -122,12 +122,17 @@ describe("OrcaChannel（替身 exec）", () => {
       if (args.includes("h2")) {
         return { code: 0, stdout: JSON.stringify({ ok: false, error: { code: "timeout", message: "timeout" } }), stderr: "" };
       }
+      if (args.includes("h3")) {
+        // ok:true 但无 wait/result.satisfied 等预期字段 → 形状无法识别 → unknown
+        return jsonResult({ ok: true, result: { something: "unexpected" } });
+      }
       return { code: 0, stdout: JSON.stringify({ ok: false, error: { code: "terminal_handle_stale" } }), stderr: "" };
     });
     const ch = new OrcaChannel(cli);
     assert.strictEqual(await ch.waitIdle("h1", 1000), "idle");
     assert.strictEqual(await ch.waitIdle("h2", 1000), "timeout");
-    assert.strictEqual(await ch.waitIdle("h3", 1000), "stale");
+    assert.strictEqual(await ch.waitIdle("h3", 1000), "unknown", "ok 但形状不明 → unknown，不得当 idle");
+    assert.strictEqual(await ch.waitIdle("h4", 1000), "stale");
     // 命令形状：--for tui-idle --timeout-ms
     assert.ok(calls[0]!.includes("--for"));
     assert.ok(calls[0]!.includes("tui-idle"));
@@ -174,5 +179,53 @@ describe("OrcaChannel（替身 exec）", () => {
     assert.ok(send.includes("--text") && send.includes("继续") && send.includes("--enter"));
     const stop = calls[1]!;
     assert.ok(stop.includes("--interrupt"));
+  });
+
+  it("V1.1 verifyStopped：connected:false / ptyKilled / status exited|closed → verified（有界轮询）", async () => {
+    const calls: string[][] = [];
+    const shapes: Array<Record<string, unknown>> = [
+      { terminal: { connected: true, status: "running" } }, // 首轮仍在运行
+      { terminal: { connected: false } }, // 次轮主对话框已关
+    ];
+    const cli = stubCli((args) => {
+      calls.push(args);
+      assert.ok(args.includes("show"), "验证走 terminal show");
+      return jsonResult(shapes.shift() ?? { terminal: { connected: true } });
+    });
+    const ch = new OrcaChannel(cli);
+    const sleeps: number[] = [];
+    const r = await ch.verifyStopped("h", { attempts: 3, intervalMs: 50, sleep: async (ms) => { sleeps.push(ms); } });
+    assert.strictEqual(r, "verified");
+    assert.deepStrictEqual(sleeps, [50], "首轮未确认后按间隔轮询一次");
+    assert.ok(calls.length >= 2);
+  });
+
+  it("V1.1 verifyStopped：ptyKilled:true → verified（PTY 已死）", async () => {
+    const cli = stubCli(() => jsonResult({ terminal: { connected: true, ptyKilled: true, status: "running" } }));
+    const ch = new OrcaChannel(cli);
+    assert.strictEqual(await ch.verifyStopped("h", { attempts: 3, intervalMs: 1, sleep: async () => {} }), "verified");
+  });
+
+  it("V1.1 verifyStopped：status=exited → verified（进程已退出）", async () => {
+    const cli = stubCli(() => jsonResult({ terminal: { connected: true, status: "exited" } }));
+    const ch = new OrcaChannel(cli);
+    assert.strictEqual(await ch.verifyStopped("h", { attempts: 3, intervalMs: 1, sleep: async () => {} }), "verified");
+  });
+
+  it("V1.1 verifyStopped：持续运行/形状不明 → 次数耗尽 → unverified（不无限轮询）", async () => {
+    let calls = 0;
+    const cli = stubCli(() => {
+      calls++;
+      // 前两次正常形状仍在运行；第三次开始形状不明（show 失败）也不得误判已停
+      return calls <= 2
+        ? jsonResult({ terminal: { connected: true, status: "running" } })
+        : { code: 1, stdout: "", stderr: "boom" };
+    });
+    const ch = new OrcaChannel(cli);
+    const sleeps: number[] = [];
+    const r = await ch.verifyStopped("h", { attempts: 3, intervalMs: 7, sleep: async (ms) => { sleeps.push(ms); } });
+    assert.strictEqual(r, "unverified");
+    assert.strictEqual(calls, 3, "有界重试：恰 attempts 次");
+    assert.deepStrictEqual(sleeps, [7, 7], "每次未确认之间都按间隔轮询");
   });
 });

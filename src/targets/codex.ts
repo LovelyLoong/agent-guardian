@@ -19,9 +19,10 @@
  */
 
 import { readFileSync, statSync } from "node:fs";
-import { computeArgsHash, evaluateSignals } from "../../../pi-task-governor/src/signals.ts";
-import type { SignalInput, ToolCallFact } from "../../../pi-task-governor/src/contract.ts";
+import { computeArgsHash, evaluateSignals } from "../shared/signals.ts";
+import type { SignalInput, ToolCallFact } from "../shared/contract.ts";
 import type { TargetAdapter, BeatFacts } from "./types.ts";
+import { withTransientRetry } from "../shared/fs.ts";
 
 const TAIL_SUMMARY_CHARS = 800;
 const TASK_SUMMARY_CHARS = 500;
@@ -95,7 +96,8 @@ export class CodexAdapter implements TargetAdapter {
     }
 
     const size = st.size;
-    const text = readFileSync(this.file, "utf-8");
+    // EBUSY/EPERM（目标 CLI 并发追加写锁）→ 瞬态重试，重试耗尽才抛（调用方按取证失败处理）
+    const text = await withTransientRetry(() => readFileSync(this.file, "utf-8"));
     // note：文件被截断/重建（字节大小小于上次记录）→ 重置解析游标与全部内存状态，
     // 全量重解析——截断后的事实（工具调用/信号/上下文用量）不得沿用旧值。
     // parsedBytes 是解码后文本的字符游标；截断检测必须用 st.size（字节），

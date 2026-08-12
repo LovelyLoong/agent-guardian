@@ -1,10 +1,10 @@
 /**
  * agent-guardian — pi 目标适配器。
  *
- * 解析 pi 会话 JSONL（形状见 pi-task-governor docs/design.md §5）：
- * - assistant 消息 content[] 里 {type:"toolCall", id, name, arguments} 为工具调用；
+ * 解析 pi 会话 JSONL（形状：assistant 消息 content[] 里
+ * {type:"toolCall", id, name, arguments} 为工具调用；
  * - 独立消息 {role:"toolResult", toolCallId, toolName, isError, content} 为工具结果；
- * 提取与信号引擎全部相对导入复用 pi-task-governor 单源（禁止复制）。
+ * 提取与信号引擎包内复用 src/shared/ 单源（禁止复制）。
  *
  * 适配器维护解析进度：每拍只追加新行到内存 entries，全量重跑共享提取
  * （确定性、幂等）；工具调用总数累计，新增数 = 与上一拍之差。
@@ -14,11 +14,12 @@
  */
 
 import { readFileSync, statSync } from "node:fs";
-import { extractToolCallsFromBranch } from "../../../pi-task-governor/src/extract.ts";
-import type { SessionEntry } from "../../../pi-task-governor/src/extract.ts";
-import { evaluateSignals } from "../../../pi-task-governor/src/signals.ts";
-import type { SignalInput } from "../../../pi-task-governor/src/contract.ts";
+import { extractToolCallsFromBranch } from "../shared/extract.ts";
+import type { SessionEntry } from "../shared/extract.ts";
+import { evaluateSignals } from "../shared/signals.ts";
+import type { SignalInput } from "../shared/contract.ts";
 import type { TargetAdapter, BeatFacts } from "./types.ts";
+import { withTransientRetry } from "../shared/fs.ts";
 
 const TAIL_SUMMARY_CHARS = 800;
 const TASK_SUMMARY_CHARS = 500;
@@ -53,9 +54,10 @@ export class PiAdapter implements TargetAdapter {
       };
     }
 
-    // 只解析"完整行"（以换行结尾）；半截尾部行留给下一拍
+    // 只解析"完整行"（以换行结尾）；半截尾部行留给下一拍。
+    // EBUSY/EPERM（目标 CLI 并发追加写锁）→ 瞬态重试，重试耗尽才抛（调用方按取证失败处理）
     const size = st.size;
-    const text = readFileSync(this.file, "utf-8");
+    const text = await withTransientRetry(() => readFileSync(this.file, "utf-8"));
     // note：文件被截断/重建（字节大小小于上次记录）→ 重置解析游标与内存条目，
     // 全量重解析——截断后的事实不得沿用旧值。
     // parsedBytes 是解码后文本的字符游标；截断检测必须用 st.size（字节），
@@ -96,7 +98,7 @@ export class PiAdapter implements TargetAdapter {
     this.lastTotal = total;
     const signals = evaluateSignals({
       toolCalls,
-      // 离线会话文件不带上下文用量 → 不评估上下文压力（与 pi-task-governor observe-session 一致）
+      // 离线会话文件不带上下文用量 → 不评估上下文压力（与 observe-session 行为一致）
       contextTokens: null,
       contextWindow: null,
       settledSeq: 1,
@@ -122,7 +124,7 @@ function parseLine(line: string): SessionEntry | null {
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
     return parsed as SessionEntry;
   } catch {
-    return null; // 坏行跳过（与 pi-task-governor 观察脚本同规则）
+    return null; // 坏行跳过（与观察脚本同规则）
   }
 }
 

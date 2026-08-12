@@ -9,7 +9,7 @@
 
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import type { Signal } from "../../pi-task-governor/src/contract.ts";
+import type { Signal } from "../src/shared/contract.ts";
 import type { BeatFacts } from "../src/targets/types.ts";
 import { initialState } from "../src/watcher/state.ts";
 import type { WatchState } from "../src/watcher/state.ts";

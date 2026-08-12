@@ -46,6 +46,15 @@
  *
  * file 通道为纯观察：send/stop 不支持，提醒/警告/停止全部只记录事件。
  *
+ * V1.1：启动裁决（单例/崩溃恢复/新任务，state.ts decideStart）、原子单例锁
+ * （<watchId>.lock append-only 租约账本选举：追加 claim → 重读账本，文件序第一条
+ * 存活 claim 胜出，恰一 acquired；每拍 renew 续租；收尾追加 release。见 state.ts）
+ * + 同进程注册表）、运行代
+ * （watchRunId/generation，事件均携带）、心跳续租（heartbeatAndSave：先续租后落盘，
+ * 丢锁不写状态——fencing 防旧 owner 覆盖新 owner）、waitIdle
+ * 未知形状按 stale 计数（不向忙碌 Agent 注入）、停止后验证
+ * （stop-verified / stop-unverified）。
+ *
  * @module
  */
 
@@ -66,7 +75,7 @@ import {
 import { buildEvidencePack, type EvidencePack, type LlmResult } from "./llm.ts";
 import { sanitizeText } from "./sanitize.ts";
 import type { StateStore, WatchState } from "./state.ts";
-import { initialState } from "./state.ts";
+import { initialState, claimRun, newRunId, LEASE_MS, claimInProcess, releaseInProcess } from "./state.ts";
 import { generateReport } from "./report.ts";
 
 export const NO_PROGRESS_SLEEP_MS = 60_000;
@@ -76,6 +85,12 @@ export const BUDGET_CHECK_SLACK_MS = 10_000;
 export const POST_WARNING_WAIT_MS = 10_000;
 export const WAIT_IDLE_MAX_MS = 600_000;
 export const PANEL_MEMBER_TIMEOUT_MS = 30 * 60_000;
+/** 停止验证（V1.1）：发出停止信号后轮询确认目标停下/退出（有界重试）。 */
+export const STOP_VERIFY_ATTEMPTS = 5;
+export const STOP_VERIFY_INTERVAL_MS = 2_000;
+/** 启动中止退出码：状态文件读取真失败（EBUSY/EPERM 瞬态重试耗尽、权限等）→ 中止启动
+ *  （可重试，瞬态清除后正常）；单例拒绝仍为 3，SIGINT 为 130。 */
+export const STATE_LOAD_ERROR_EXIT_CODE = 4;
 
 export interface WatchOptions {
   watchId: string;
@@ -87,6 +102,8 @@ export interface WatchOptions {
   sessionFile: string | null;
   /** 面板方向流程（LLM 返回 panel）的执行器；null = 跳过并记录 */
   runPanel: ((question: string) => Promise<string | null>) | null;
+  /** 停止验证轮询参数（测试可注入小值；缺省 5 次×2s） */
+  stopVerify?: { attempts?: number; intervalMs?: number };
 }
 
 export interface WatchServices {
@@ -102,26 +119,80 @@ export interface WatchServices {
 
 export interface WatchResult {
   exitCode: number;
-  state: WatchState;
+  /** 启动被拒（单例/状态读取失败中止启动）时为 null */
+  state: WatchState | null;
   reportPath: string | null;
+  /** 启动被拒原因（单例锁 / 状态读取失败中止启动）；null = 正常启动并运行 */
+  denied: string | null;
 }
 
 /**
  * 运行监督循环直至正常收尾。返回进程退出码。
  */
 export async function runWatch(opts: WatchOptions, services: WatchServices): Promise<WatchResult> {
-  const existing = await services.state.load(opts.watchId);
-  const state = existing ?? initialState({
-    watchId: opts.watchId,
-    budgetMs: opts.budgetMs,
-    targetKind: services.target.kind,
-    channelKind: services.channel.kind,
-    handle: opts.handle,
-    sessionFile: opts.sessionFile,
+  // 同进程单例：内存已声明 watchId 注册表（Promise.all 双跑场景）；
+  // 跨进程由 <watchId>.lock 租约账本选举保证（见 StateStore.claimLock）。
+  if (!claimInProcess(opts.watchId)) {
+    return {
+      exitCode: 3,
+      state: null,
+      reportPath: null,
+      denied: "本进程内已存在该 watch 的监督运行（同 handle 双启动），拒绝重复启动",
+    };
+  }
+  try {
+    return await runWatchLocked(opts, services);
+  } finally {
+    releaseInProcess(opts.watchId);
+  }
+}
+
+async function runWatchLocked(opts: WatchOptions, services: WatchServices): Promise<WatchResult> {
+  const loaded = await services.state.load(opts.watchId);
+  if (loaded.kind === "error") {
+    // W5 终审裁决（升级）：状态文件读取真失败（EBUSY/EPERM 瞬态重试耗尽、权限等）
+    // ≠ 无状态——不得当作无状态 fresh 启动（可能掩盖既有 active 状态/安全闩锁），
+    // 也不得降级继续（EBUSY 风暴下 claimLock/首拍心跳会覆写可能仍有效的旧状态）。
+    // 中止启动：不写任何共享文件（无事件、无 state、无报告；中止发生在 claim 之前，
+    // 账本零写入，无需 release）、以错误退出码退出——用户可重试，瞬态清除后正常。
+    // missing（ENOENT）才是合法首次运行的静默 fresh 路径。
+    return {
+      exitCode: STATE_LOAD_ERROR_EXIT_CODE,
+      state: null,
+      reportPath: null,
+      denied: `状态文件读取失败（${loaded.reason}），既有状态无法确认——中止启动（未写任何状态/事件/报告），请稍后重试`,
+    };
+  }
+  const existing = loaded.kind === "ok" ? loaded.state : null;
+  const watchRunId = newRunId();
+  // V1.2 单例选举：追加 claim 行 → 重读账本求值，文件序第一条存活 claim 为
+  // 胜者（恰一）；胜者非己 → 拒绝（exit 3）；fresh/resume 由状态裁决 decideStart
+  // 决定（crash resume 语义不变）。
+  const claim = await services.state.claimLock(opts.watchId, {
+    prev: existing,
+    watchRunId,
     now: services.now(),
   });
+  if (claim.kind === "denied") {
+    return { exitCode: 3, state: null, reportPath: null, denied: claim.reason };
+  }
+  const start = claim.start;
+  const generation = (existing?.generation ?? 0) + 1;
+  const state = existing !== null && start.kind === "resume"
+    ? claimRun(existing, { watchRunId, generation, now: services.now() })
+    : initialState({
+        watchId: opts.watchId,
+        budgetMs: opts.budgetMs,
+        targetKind: services.target.kind,
+        channelKind: services.channel.kind,
+        handle: opts.handle,
+        sessionFile: opts.sessionFile,
+        now: services.now(),
+        watchRunId,
+        generation,
+      });
 
-  if (existing === null) {
+  if (start.kind === "fresh") {
     recordOrDegrade(services, opts, state, {
       type: "watch_start",
       targetKind: services.target.kind,
@@ -132,7 +203,7 @@ export async function runWatch(opts: WatchOptions, services: WatchServices): Pro
   } else {
     recordOrDegrade(services, opts, state, { type: "watch_resume", settledBeats: state.settledBeats });
   }
-  await services.state.save(opts.watchId, state);
+  if (!(await heartbeatAndSave(services, opts, state))) return lockLost(services, opts, state);
 
   const decideOpts: DecideOptions = {
     remindMax: opts.remindMax,
@@ -166,15 +237,25 @@ export async function runWatch(opts: WatchOptions, services: WatchServices): Pro
       ? POST_WARNING_WAIT_MS
       : clamp(remaining + BUDGET_CHECK_SLACK_MS, 10_000, WAIT_IDLE_MAX_MS);
 
-    let idle: "idle" | "timeout" | "stale";
+    let idle: "idle" | "timeout" | "stale" | "unknown";
     try {
       idle = await services.channel.waitIdle(opts.handle, waitMs);
     } catch {
       idle = "stale";
     }
-    if (idle === "stale") {
+    // V1.1 心跳续租（F3）：租约随 heartbeatAndSave 每拍续签（先 renew 后落盘），
+    // 所有落盘分支统一经 heartbeatAndSave 刷新 leaseExpiresAt——此处不再做内存
+    // 赋值（与 beat 起始续租重复，且会误读为"已续租"）。stale/unknown 分支不落盘
+    // 不续租，租约由上次续签覆盖：waitIdle 单窗 ≤600s、stale 上限 2 拍 × 60s，
+    // 远小于 LEASE_MS 20min 余量。
+    // V1.1：waitIdle 返回无法识别的形状（“unknown”）与 stale 同等计数——
+    // 不得当 idle 向忙碌 Agent 注入（连续 2 次即收尾）。
+    if (idle === "stale" || idle === "unknown") {
       staleCount++;
-      record({ type: "target-unreachable", note: "waitIdle 无法触达被观察对象" });
+      record({
+        type: "target-unreachable",
+        note: idle === "unknown" ? "waitIdle 返回无法识别的形状" : "waitIdle 无法触达被观察对象",
+      });
       if (staleCount >= STALE_LIMIT) {
         record({ type: "target-gone", reason: "连续两次无法触达被观察对象" });
         return finish(services, opts, state, 0, "目标连续不可达");
@@ -217,7 +298,7 @@ export async function runWatch(opts: WatchOptions, services: WatchServices): Pro
     // M3：从未成功取证（lastGoodCursor === null，含首拍取证失败且游标为空）→ 不得跳过取证。
     if (read.cursor === state.cursor && lastGoodCursor !== null) {
       state.settledBeats++;
-      await services.state.save(opts.watchId, state);
+      if (!(await heartbeatAndSave(services, opts, state))) return lockLost(services, opts, state);
       // B1 + M2：安全网最后警告已发出 → 本拍无进展（游标不前进且仍 alive）→ 判定改善：
       // 会话适配器（--terminal + --session）先取证一次——newToolCalls>0 → 清闩（改善）；
       // 否则（无新增调用/取证失败）或纯 terminal 目标（无证据源）→ 立即 stop。
@@ -227,7 +308,7 @@ export async function runWatch(opts: WatchOptions, services: WatchServices): Pro
           postWarning = false;
           state.safetyWarningSent = false;
           state.safetyWarningTrigger = null;
-          await services.state.save(opts.watchId, state);
+          if (!(await heartbeatAndSave(services, opts, state))) return lockLost(services, opts, state);
           record({ type: "safety-warning-cleared", note: "触发信号已消失且会话文件有新增调用（newToolCalls>0），清闩" });
         } else {
           await executeStop(services, opts, state, "最后警告后目标无改善（安全网）");
@@ -246,7 +327,7 @@ export async function runWatch(opts: WatchOptions, services: WatchServices): Pro
         state.safetyWarningSent = true;
         state.safetyWarningTrigger = "budget";
         state.lastAction = "safety-warning";
-        await services.state.save(opts.watchId, state);
+        if (!(await heartbeatAndSave(services, opts, state))) return lockLost(services, opts, state);
         await steerOrRecord(services, opts, state, "safety-warning", SAFETY_WARNING_BUDGET_TEXT);
         postWarning = true;
         continue;
@@ -265,7 +346,7 @@ export async function runWatch(opts: WatchOptions, services: WatchServices): Pro
         state.safetyWarningSent = false;
         state.safetyWarningTrigger = null;
         state.settledBeats++;
-        await services.state.save(opts.watchId, state);
+        if (!(await heartbeatAndSave(services, opts, state))) return lockLost(services, opts, state);
         record({ type: "safety-warning-cleared", note: "会话文件新增调用（newToolCalls>0），清闩" });
         await services.sleep(NO_PROGRESS_SLEEP_MS);
         continue;
@@ -308,7 +389,7 @@ export async function runWatch(opts: WatchOptions, services: WatchServices): Pro
         return finish(services, opts, state, 0, "连续取证失败超上限，目标适配器持续不可用（degraded）");
       }
       state.settledBeats++;
-      await services.state.save(opts.watchId, state);
+      if (!(await heartbeatAndSave(services, opts, state))) return lockLost(services, opts, state);
       await services.sleep(NO_PROGRESS_SLEEP_MS);
       continue;
     }
@@ -330,7 +411,7 @@ export async function runWatch(opts: WatchOptions, services: WatchServices): Pro
         postWarning = false;
         state.safetyWarningSent = false;
         state.safetyWarningTrigger = null;
-        await services.state.save(opts.watchId, state);
+        if (!(await heartbeatAndSave(services, opts, state))) return lockLost(services, opts, state);
         record({ type: "safety-warning-cleared", note: "触发信号已消失且自警告起有新增工具调用，清闩" });
       } else {
         await executeStop(services, opts, state, "最后警告后目标无改善（安全网）");
@@ -354,7 +435,7 @@ export async function runWatch(opts: WatchOptions, services: WatchServices): Pro
       // 落 degraded 事件后继续，watcher 不得崩溃。
       record({ type: "decide-error", note: `决策异常，本拍跳过: ${String(err)}` });
       state.settledBeats++;
-      await services.state.save(opts.watchId, state);
+      if (!(await heartbeatAndSave(services, opts, state))) return lockLost(services, opts, state);
       await services.sleep(NO_PROGRESS_SLEEP_MS);
       continue;
     }
@@ -418,7 +499,7 @@ export async function runWatch(opts: WatchOptions, services: WatchServices): Pro
     }
 
     state.settledBeats++;
-    await services.state.save(opts.watchId, state);
+    if (!(await heartbeatAndSave(services, opts, state))) return lockLost(services, opts, state);
   }
 }
 
@@ -489,6 +570,16 @@ async function executeStop(services: WatchServices, opts: WatchOptions, state: W
   try {
     await services.channel.stop(opts.handle);
     recordOrDegrade(services, opts, state, { type: "stop-issued", note: "已发出停止信号" });
+    // V1.1 停止验证：发出停止信号后轮询通道确认目标真的停下/退出（有界重试），
+    // 结果记入事件（stop-verified / stop-unverified），不静默当已生效。
+    const verdict = await services.channel.verifyStopped(opts.handle, {
+      attempts: opts.stopVerify?.attempts ?? STOP_VERIFY_ATTEMPTS,
+      intervalMs: opts.stopVerify?.intervalMs ?? STOP_VERIFY_INTERVAL_MS,
+    });
+    recordOrDegrade(services, opts, state, {
+      type: verdict === "verified" ? "stop-verified" : "stop-unverified",
+      note: verdict === "verified" ? "已确认目标停止/退出" : "轮询期限内未能确认目标停止（不视为已停）",
+    });
   } catch (err) {
     // file 通道（纯观察）或停止失败：只记录
     recordOrDegrade(services, opts, state, {
@@ -496,6 +587,54 @@ async function executeStop(services: WatchServices, opts: WatchOptions, state: W
       note: err instanceof UnsupportedError ? "纯观察模式，未发送停止信号" : String(err),
     });
   }
+}
+
+/**
+ * V1.1 心跳落盘（F1 fencing：先续租后落盘）。每拍先做租约账本续租
+ * （renewLock 归属校验——非胜者 renew 无效），通过才原子写盘；续租失败
+ * （单例锁已被其他进程接管）→ 不写状态、不追加事件，返回 false，调用方走
+ * 异常收尾 lockLost（丢锁后 state/events 已属新 owner，旧 owner 不得覆盖）。
+ * 终态（status=finished）不续租——收尾路径由 finish 先做归属校验再落盘。
+ */
+async function heartbeatAndSave(
+  services: WatchServices,
+  opts: WatchOptions,
+  state: WatchState,
+): Promise<boolean> {
+  const now = services.now();
+  state.leaseExpiresAt = now + LEASE_MS;
+  if (state.status === "active") {
+    if (!services.state.renewLock(
+      opts.watchId,
+      {
+        watchRunId: state.watchRunId,
+        ownerPid: state.ownerPid,
+        leaseExpiresAt: state.leaseExpiresAt,
+      },
+      now,
+    )) {
+      return false; // 丢锁：不得写状态（fencing），lockLost 只落 stderr
+    }
+  }
+  await services.state.save(opts.watchId, state);
+  return true;
+}
+
+/**
+ * 单例锁归属丢失（已被其他进程接管）→ 异常收尾：只向 stderr 说明后终止。
+ * 丢锁后 state 文件与共享 events 文件已属新 owner——不得写状态、不得追加事件
+ * （lockLost 的信息只写本地 stderr，事件流由新 owner 独占；自己的 claim 行
+ * 留存账本也会随租约过期自然失效，无需也不得再动账本）。
+ */
+async function lockLost(
+  services: WatchServices,
+  opts: WatchOptions,
+  state: WatchState,
+): Promise<WatchResult> {
+  console.error(
+    `[guardian] 单例锁已被其他进程接管（watch ${opts.watchId}），终止监督（不写状态、不追加事件）`,
+  );
+  return { exitCode: 0, state, reportPath: null, denied: null };
 }
 
 /**
@@ -509,6 +648,9 @@ function recordOrDegrade(
   state: WatchState,
   event: { type: string; [key: string]: unknown },
 ): boolean {
+  // V1.1：所有事件携带本运行代（runId + generation），历史按运行区分。
+  event["runId"] = state.watchRunId;
+  event["generation"] = state.generation;
   const ok = recordEvent(services, opts.watchId, event);
   if (!ok) state.eventsDegraded = true;
   return ok;
@@ -538,6 +680,18 @@ async function finish(
   reason: string,
 ): Promise<WatchResult> {
   state.lastAction = state.lastAction ?? "finished";
+  // V1.1：正常收尾 → 终态 status=finished（下次启动默认视为新任务）。
+  state.status = "finished";
+  // W4 文件协议边界声明：<watchId>.json/.lock 之间无 OS 级可移植原子锁（零运行时
+  // 依赖，不引入平台专属 flock 等）——归属校验与终态 rename 之间仍存在微秒级接管
+  // 窗口（他进程 claim 恰在此窗口内当选）。后果可自愈：新 owner 首次心跳覆写
+  // state、其自身 finish 重生成报告；旧 owner 迟到落地最多一行冗余 finish 事件
+  // （事件携带 runId，可区分）。缓解三点：
+  // ① 归属校验置于终态 save 前最后一跳（事件追加先行可保留——冗余事件自愈，save
+  //    前重新校验）；
+  // ② save 后立即 read-back 复检 leaseWinner——丢锁 → stderr 警告，此后不再写任何
+  //    共享文件（state/事件/报告均不写），仅追加自己的 release 行；
+  // ③ 本注释即窗口声明。
   // 先追加 finish 事件（含实际收尾原因）再生成报告：报告必须能看到收尾事件，
   // 不得误显"未记录收尾事件"。reportPath 目标路径可预先确定。
   const path = join(services.reportsDir, `${opts.watchId}.md`);
@@ -547,19 +701,56 @@ async function finish(
     reportPath: path,
     reason,
   });
+  // W4-①：终态 save 前最后一跳归属校验——丢锁（他人已接管）→ 跳过 save/报告写入
+  // （事件已先行落一行冗余 finish，属可自愈），仅追加自己的 release 行（release
+  // 只杀死自己的 runId，永远安全）。
+  const winner = services.state.leaseWinner(opts.watchId, services.now());
+  if (winner === null || winner.runId !== state.watchRunId) {
+    services.state.releaseLock(opts.watchId, {
+      watchRunId: state.watchRunId,
+      ownerPid: state.ownerPid,
+      leaseExpiresAt: state.leaseExpiresAt,
+    });
+    console.error(
+      `[guardian] 收尾时单例锁已被其他进程接管（watch ${opts.watchId}），跳过状态/报告写入（已先落一行冗余 finish 事件，属可自愈），仅追加 release 行`,
+    );
+    return { exitCode, state, reportPath: null, denied: null };
+  }
   // m1：终态事件发生后再次落盘状态——recordOrDegrade 可能刚把 eventsDegraded
   // 置 true（stop/steer/finish 记录失败），若不重存，guardian report 重载状态
   // 文件将丢失降级标记。
-  await services.state.save(opts.watchId, state);
+  await heartbeatAndSave(services, opts, state);
+  // W4-②：save 后立即 read-back 复检——①校验至 rename 间微秒级窗口内的接管由复检
+  // 兜底：丢锁 → stderr 警告，且此后不再写任何共享文件（报告/降级事件均不得写），
+  // 仅追加自己的 release 行。
+  const winnerAfterSave = services.state.leaseWinner(opts.watchId, services.now());
+  if (winnerAfterSave === null || winnerAfterSave.runId !== state.watchRunId) {
+    services.state.releaseLock(opts.watchId, {
+      watchRunId: state.watchRunId,
+      ownerPid: state.ownerPid,
+      leaseExpiresAt: state.leaseExpiresAt,
+    });
+    console.error(
+      `[guardian] 终态落盘后复检发现单例锁已被其他进程接管（watch ${opts.watchId}），不再写报告/事件，仅追加 release 行`,
+    );
+    return { exitCode, state, reportPath: null, denied: null };
+  }
+  // V1.2 租约账本收尾：追加 release 行（账本不删除，runId 永久死亡），下次
+  // 启动的 claim 直接当选后走状态裁决（finished → fresh）。
+  services.state.releaseLock(opts.watchId, {
+    watchRunId: state.watchRunId,
+    ownerPid: state.ownerPid,
+    leaseExpiresAt: state.leaseExpiresAt,
+  });
   const report = generateReport(state, services.events.readState(opts.watchId), { finishRecorded });
   try {
     mkdirSync(services.reportsDir, { recursive: true });
     writeFileSync(path, report, "utf-8");
-    return { exitCode, state, reportPath: path };
+    return { exitCode, state, reportPath: path, denied: null };
   } catch {
     recordOrDegrade(services, opts, state, { type: "report-write-failed", note: "报告写入失败" });
-    await services.state.save(opts.watchId, state);
-    return { exitCode, state, reportPath: null };
+    await heartbeatAndSave(services, opts, state);
+    return { exitCode, state, reportPath: null, denied: null };
   }
 }
 

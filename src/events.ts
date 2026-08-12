@@ -10,8 +10,10 @@
  * @module
  */
 
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { mkdirSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { redactValue } from "./watcher/redact.ts";
+import { appendFileSyncRetry, readFileSyncRetry } from "./shared/fs.ts";
 
 export interface EventEntry {
   ts: string;
@@ -40,27 +42,34 @@ export class EventStore {
   /**
    * 追加一条事件。返回 true = 落盘成功；false = 写入失败（降级）。
    * 失败不阻塞监督主流程，但调用方拿到显式失败信号，不得当作已记录。
+   * 写入走 shared/fs.ts 瞬态重试（EBUSY/EPERM——他进程正在读本文件时追加
+   * 会撞写锁），重试耗尽才按失败降级（返回 false）。
+   * V1.1 脱敏：写入前对事件全量递归执行秘密模式过滤；命中秘密文本时
+   * 替换为 [REDACTED] 并在事件上标 redacted:true。
    */
   append(watchId: string, event: { type: string; [key: string]: unknown }): boolean {
     try {
       mkdirSync(this.dir, { recursive: true });
-      const entry: EventEntry = { ts: new Date().toISOString(), watchId, ...event };
-      appendFileSync(this.fileFor(watchId), JSON.stringify(entry) + "\n", "utf-8");
+      const redacted = redactValue({ ts: new Date().toISOString(), watchId, ...event });
+      const entry = redacted.value as EventEntry;
+      if (redacted.changed) entry["redacted"] = true;
+      appendFileSyncRetry(this.fileFor(watchId), JSON.stringify(entry) + "\n");
       return true;
     } catch {
       return false; // 落盘失败不阻塞监督（噪音纪律：默认沉默），但显式返回降级状态
     }
   }
 
-  /** 读取状态：事件列表 + 是否降级。文件不存在 = 合法空（degraded:false）。 */
+  /** 读取状态：事件列表 + 是否降级。文件不存在 = 合法空（degraded:false）。
+   *  EBUSY/EPERM（Windows 读撞上并发追加写锁）→ 瞬态重试，重试耗尽才视为真错误。 */
   readState(watchId: string): EventReadResult {
     let text: string;
     try {
-      text = readFileSync(this.fileFor(watchId), "utf-8");
+      text = readFileSyncRetry(this.fileFor(watchId));
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === "ENOENT") return { events: [], degraded: false };
-      return { events: [], degraded: true }; // 不可读（权限/IO 等）→ 显式降级，不静默当空
+      return { events: [], degraded: true }; // 不可读（权限/IO/瞬态重试耗尽）→ 显式降级，不静默当空
     }
     const out: EventEntry[] = [];
     let degraded = false;

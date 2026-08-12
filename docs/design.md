@@ -2,7 +2,7 @@
 
 > 定位：通用跨 CLI 运行期监督与讨论组编排。**LLM 只出现在判断点，循环/状态/执行全部机械化**。
 > 来源：supervisor-governor-handoff.md 的教训 + agent-supervisor/agent-panel skill 首次真实演练暴露的半成品病灶（协议写在 prompt 里）。
-> 本包是 pi-task-governor 的演进上级：信号引擎经相对导入单源复用，本包拥有通道/目标适配器/watcher/panel/状态机。
+> 本包是 pi-task-governor 的演进上级：信号引擎 V1.1 起随包内置（src/shared/），本包拥有通道/目标适配器/watcher/panel/状态机，无外部依赖。
 
 ## 0. 三条不可让渡的设计原则
 
@@ -29,7 +29,7 @@ agent-guardian/
 │   │   └── file.ts         # 纯观察：tail 会话文件 + 写报告（无 Orca 也能用、单测零依赖）
 │   ├── targets/
 │   │   ├── types.ts        # TargetAdapter 接口：resolveFacts() → BeatFacts
-│   │   ├── pi.ts           # pi 会话 JSONL（复用 pi-task-governor extract+signals）
+│   │   ├── pi.ts           # pi 会话 JSONL（包内复用 src/shared/ extract+signals）
 │   │   ├── codex.ts        # codex rollout JSONL → ToolCallFact（新解析器）
 │   │   └── terminal.ts     # 兜底：仅活性+游标（无会话文件场景）
 │   ├── watcher/
@@ -39,12 +39,12 @@ agent-guardian/
 │   │   └── llm.ts          # LLM 回调契约（可插拔命令；默认关闭=纯机械）
 │   ├── panel/
 │   │   └── runner.ts       # fan-out/收齐/综合/解散，两种后端
-│   └── shared/             # 从 ../pi-task-governor/src/ 相对导入 signals/extract（单源，文档化 sibling 要求）
+│   └── shared/             # 信号引擎+提取单源（V1.1 迁入，随包内置；pi-task-governor 反向相对导入）
 ├── test/                   # node --test，全部经 file channel + 注入替身，零 Orca 依赖
 └── docs/acceptance-<date>.md
 ```
 
-零运行时依赖；Node ≥23（type-stripping）；与 pi-task-governor 必须 sibling 检出（`C:\PiWorkbench\packages\` 同级）。
+零运行时依赖；Node ≥23（type-stripping）；独立检出即可运行，无需任何同级项目（V1.1：引擎正主已迁入本包）。
 
 ## 2. 核心抽象
 
@@ -140,7 +140,7 @@ guardian report --watch <id>                 # 输出/重生成完工汇报
 
 ## 6. 与既有资产的关系
 
-- 信号引擎/提取：`import ... from "../pi-task-governor/src/signals.ts"`（单源，禁止复制）。
+- 信号引擎/提取：正主在 `src/shared/{signals,extract,contract}.ts`（V1.1 从 pi-task-governor 迁入，禁止复制）；pi-task-governor 的 src/signals.ts / src/extract.ts 变为 re-export 垫片，运行时路径（governor.ts、scripts/observe-session.ts）直接反向相对导入本包。
 - agent-supervisor SKILL.md 瘦身为"如何启动 guardian watch + LLM 被回调时的行为说明"；agent-panel SKILL.md 瘦身为"panel 成员行为说明 + guardian panel 调用"。
 - pi-task-governor 扩展继续其进程内影子角色，不变。
 
@@ -157,3 +157,33 @@ guardian report --watch <id>                 # 输出/重生成完工汇报
 ## 8. 明确不做（V1）
 
 自动挂接新终端（automations 集成）；web UI；跨机 supervisor（--on 远端）；codex 目标的 steer 以外深度集成；多 watcher 协调。留接口不实现。
+
+## 9. V2 方向（Sidecar Supervisor 语义层——用户多窗口语料已对齐，2026-08-12）
+
+语料来源：09-00 窗口（归属裁决）、13-51 窗口（完整架构 + 硬软分权 + V1 批判）。本节的每条修订都已获用户立场确认，是 V2 实现基线。
+
+### 9.1 归属
+agent-guardian 定位从"pi 系工具"修正为 **Orca sidecar controller**：跨 Agent 的终端编排与生命周期功能归 Orca 侧；pi/codex 各 CLI 只做适配器；pi-task-governor 仅贡献纯信号算法（V1.1 已迁正主入本包）。Skill 只负责一句话启动，不承担循环逻辑。
+
+### 9.2 干预语义重排（V1 行为级变更，用户语料原文依据）
+
+| V1 行为 | V2 行为 | 依据 |
+|---|---|---|
+| 打转无改善/提醒复现 → 自动 stop | WARNING 须 ACK；无 ACK 升级用户；**pause（可逆）代替 stop** | "检测到 spin → 触发 Supervisor 分析 ≠ spin 本身就是停止依据" |
+| 预算到期 → 警告→stop 主 Agent | guardian 汇报并**自己退出**，不动主 Agent | "监督预算到期 → Guardian 汇报并退出 ≠ 主 Agent必须被停止" |
+| 机械信号 → 提醒/升级 | 信号只触发 Supervisor 分析（L1 Advise / L2 Acknowledge） | 代理指标可提醒，无资格终止 |
+| stop 宽泛 | **L4 仅限客观硬边界**：破坏性命令、凭据泄露、超费用上限、覆盖用户未提交修改 | 硬化四条件：客观可观测/误报已验证/动作与证据成比例/可逆 |
+
+五级干预梯度：L0 Observe / L1 Advise / L2 Acknowledge / L3 Human Gate / L4 Mechanical Block。升级依据=新证据/风险变化/主 Agent 确认/不可逆性，**不是计数器**。
+
+### 9.3 V2 交付项（按序）
+1. 任务契约 `contract.json`（原始需求/验收标准/范围边界/已批准决策），watch 时 `--contract` 挂载，不可变。
+2. `guardian-judge` profile：固定 supervisor system prompt、只读工具、证据视为不可信数据、强制 JSON schema——让 LLM 层真正工作（V1 的裸 --llm 回调是断的）。
+3. 结构化事件传感：git diff 快照、测试结果、工具事件（替代纯终端文本）；milestone_ready 时主 Agent 提供 diff+测试+未决问题。
+4. incident 生命周期 FSM：open→delivered→ACK（accepted/rejected-with-reason/deferred）→resolved；机械内核持有 mailbox 与送达确认。
+5. 分级消息：NOTE 进队列不阻断 / WARNING 须 ACK（可完成当前原子操作）/ BLOCK 暂停门（仅限破坏性/凭据/越权/验收失效）。
+6. 完工后 fresh-context reviewer 独立验收（原始需求+最终 diff+验收标准+测试证据），长期 Supervisor 不得兼任终验。
+7. Panel 降级为方向争议辅助件：异步（watch 不停）、带证据材料、只读成员。
+
+### 9.4 不共享原则
+Supervisor 共享事实与决策（需求/验收标准/diff/测试输出/主 Agent 声明的阶段），**不继承主 Agent 的推理过程与自我辩护**——防锚定附和。同 checkout 只读，不开独立 worktree。

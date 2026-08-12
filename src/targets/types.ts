@@ -1,14 +1,15 @@
 /**
  * agent-guardian — 目标适配器契约。
  *
- * 适配器从被观察者提取机械事实（信号引擎复用 pi-task-governor 单源）。
+ * 适配器从被观察者提取机械事实（信号引擎包内复用 src/shared/ 单源）。
  * 适配器内部维护自己的解析进度（内存态，崩溃恢复时全量重解析，结果确定性）。
  *
  * @module
  */
 
 import { readFileSync } from "node:fs";
-import type { Signal } from "../../../pi-task-governor/src/contract.ts";
+import type { Signal } from "../shared/contract.ts";
+import { readFileSyncRetry } from "../shared/fs.ts";
 
 export interface BeatFacts {
   /** 累计工具调用数（无法统计时 -1） */
@@ -41,7 +42,8 @@ export interface TargetAdapter {
  */
 export function detectTargetKind(file: string): "pi" | "codex" {
   try {
-    const head = readFileSync(file, "utf-8").split(/\r?\n/, 2).join("\n");
+    // EBUSY/EPERM（目标 CLI 并发追加写锁）→ 瞬态重试，重试耗尽才落到命名兜底
+    const head = readFileSyncRetry(file).split(/\r?\n/, 2).join("\n");
     const firstLine = head.split(/\r?\n/)[0];
     if (firstLine !== undefined) {
       const parsed: unknown = JSON.parse(firstLine);
